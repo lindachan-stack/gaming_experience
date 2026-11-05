@@ -1,0 +1,104 @@
+seed: 42
+
+data:
+  merchant: TCG                      # 商戶
+  currency: PHP                      # 幣別（只讀 bet_records 的 currency=PHP）
+  game: "22071"                      # 遊戲代號
+                                     # 三者決定快取與輸出的資料夾（不含日期，見 feel_engine/paths.py）：
+                                     #   注單 data/bet_records/bet_records_TCG_22071_tz+0（UTC 日檔）
+                                     #   標籤 data/tags/dwt_player_game_tag_wi_test_TCG_PHP_22071_lag1w_asof（每個套用週一檔）
+                                     #   延伸期間：loader 給新的 --start／--end，只抓缺的日子
+  train_start: "2026-09-28"          # 美東；訓練期間第一天
+  train_end: "2026-10-11"            # 美東；訓練期間最後一天（含）
+  valid_start: "2026-10-12"          # 美東；驗證期間第一天，須晚於 train_end
+  valid_end: "2026-10-18"            # 美東；驗證期間最後一天（含）；AUC、葉子 × 版本留存率都在驗證期間計算
+                                     # dataset 一天一檔（output/TCG_PHP_22071/dataset/），所有 run 共用；build 只建還沒有的日子，
+                                     # run 依 session_date 取訓練期間與驗證期間的日子（中間空出的日子不讀）
+                                     # 輸出：output／result 的 {merchant}_{currency}_{game}/train_{起}-{迄}_valid_{起}[-{迄}]/（驗證只有一天時只寫一個日期）
+  pre_hours: 6                       # 往前多讀：判斷午夜後的手是否接續前一天的 session（是 → 整段歸前一天，不出決策點）
+  post_hours: 12                     # 截尾：session 須在起點隔天 0 點 + 此值前結束（再加 return_window 判斷 Y），否則整段不抽
+                                     # 決策點歸屬日 = session 起點的美東日期；訓練期間與驗證日交界的 session 整段歸前一天（訓練）
+
+compute:
+  n_buckets: 48                      # 讀 5 天以上 16 桶、14 天以上 32 桶、20 天以上 48 桶，每桶約 3 百萬手，worker 記憶體約 2–3 GB
+  workers: 2                         # 每個 worker 約需 1 GB
+
+modules:
+  version_map:                       # game_version → 原版本；未填完時 build 只輸出版本分佈後停止
+    "22071_1.0.0_0": null            # （cli build --provisional-arm 可先以 game_version 暫代 arm）
+    "22071_1.0.0_1": null
+    "22071_1.0.0_2": null
+    "22071_1.0.0_3": null
+    "22071_1.0.0_5": null
+  rtp_level: {low: 96.0, mid: 96.5, high: 97.0}   # 設計值；low 為暫定
+  design:                            # 波動度 × 倍率 × RTP；source = 提供離線資料的原版本
+    M1: {name: 保護傘, volatility: mid,  multiplier: mid,  rtp: high, source: 保護傘}
+    M2: {name: 標準,   volatility: mid,  multiplier: mid,  rtp: mid,  source: 原模組}
+    M3: {name: 冷卻,   volatility: mid,  multiplier: mid,  rtp: low,  source: null}
+    M4: {name: 驚喜,   volatility: mid,  multiplier: high, rtp: high, source: 高倍數}
+    M5: {name: 高倍數, volatility: high, multiplier: high, rtp: mid,  source: 高倍數}
+    M6: {name: 高波動, volatility: high, multiplier: mid,  rtp: mid,  source: 深模組}
+    M7: {name: 極限,   volatility: high, multiplier: high, rtp: low,  source: null}
+  baseline: 原模組
+  deployable: [M1, M2, M4, M5, M6]   # M3、M7 實作後再加入
+
+labels:
+  session_gap_minutes: 30
+  churn_window_spins: 20             # 同時是決策間隔
+  return_window_hours: 24
+  arm_dominance: 0.8                 # 窗口內主版本佔比 ≥ 此值的決策點才抽入樣本
+                                     # 調整依據：符合比例，以及符合／不符合者的狀態差異
+
+weighting:
+  player_day_cap: 50                 # 每位玩家每天的權重總和上限
+                                     # 調整依據：w_cap < 1 的比例與價值分層結果
+
+splits:                              # split = all／lifecycle（SEG_lifecycle）／value（SEG_value = TAG_value_combined）
+  min_segment_train_n: 10000         # 【整體與分群｜整棵樹】一棵樹的訓練期間決策點至少幾筆；分群的群少於此數 → 不自建樹，沿用 all 的樹
+  groups:                            # 指定 split 只對這些群建模（樣本仍需 ≥ min_segment_train_n，否則沿用 all 的樹）；
+    value: [低, 中, 高]              # 未列出的群（無紀錄、本週無下注、手數過低）在該 split 不建模、不評估
+
+features:
+  derived:                           # 調整依據：各旗標的觸發比例
+    dry_min_spins: 100               # GP_flag_dryLong：今日手數下限
+    cold_nowin_rate: 0.8             # GP_flag_coldLoss：今日 NO_WIN 比例下限
+    loss_ratio: 0.3                  # GP_flag_coldLoss：balance 相對進場的跌幅
+
+tree:
+  max_depth: 4                       # 【整體與分群】樹的最大深度
+  min_impurity_decrease: 0.00005     # 【整體與分群】每次切分至少要讓流失預測改善多少（sklearn 加權不純度下降，以該棵樹全部樣本計）；
+                                     # 改善太小的切分不切，樹較精簡；0 = 只要有改善就切
+  min_samples_leaf: 1000             # 【整體與分群｜每片葉子】每片葉子至少幾筆訓練期間決策點
+
+leaf_eval:
+  min_n_per_arm: 300                 # 【每片葉子 × 每個版本】驗證期間的樣本至少幾筆，才算樣本足夠、能比較留存率
+  dominant_share: 0.8                # 樣本足夠的版本不到兩個、且同一版本佔葉子決策點超過此值（>）→ 維持現狀_X（不計入信心分數、不合併）
+  propensity_model: logistic         # logistic = 多項式邏輯迴歸；gbm = 梯度提升樹
+  balance_calibration: true          # 葉子內校準：讓各版本加權後的平均狀態對齊葉子的共同範圍（只用資料，不用遊戲端規則）
+                                     # 留存率用雙重穩健估計：結果模型預測 ＋ 校準權重修正誤差
+  balance_tolerance: 0.1             # 校準目標：各共變數的加權平均與共同範圍相差 ≤ 此值個標準差；
+                                     # 越小越平衡、但權重越不平均、有效樣本越少
+  overlap_min: 0.05                  # 【每片葉子】共同範圍：只用「每個比較版本被分到的機率都 ≥ 此值」的決策點比較
+  min_overlap_share: 0.8             # 【每片葉子】盡量多比幾個版本，但共同範圍要涵蓋葉子決策點至少此比例；
+                                     # 任何組合都做不到 → 選涵蓋最多的組合，信心最多「低」
+  smd_threshold: 0.2                 # 平衡：加權後各共變數與共同範圍相差不到此值個標準差
+  similar_merge_over_leaves: 8       # 合併相近建議：合併相同建議後葉子仍超過此數的樹，才再併建議不同、
+                                     # 但兩片都不是高信心的相鄰葉子；其他樹只併相同建議
+  bootstrap_reps: 300
+
+five_feelings:                       # 五個體感補位：沒被任何葉子建議的版本，在葉子內找子規則補位（SPEC 9.4）
+  enabled: true                      # false → 不補位、實驗頁沒有「五個體感」分頁
+  max_loss_pp: 2.0                   # 補位：比原建議版本低不超過此值（加權留存率點估計，百分點）
+  min_comparable_share: 0.5          # 補位：子規則內可比區（兩個版本都可能被發到）至少佔此比例，否則差距多半反映誰拿到、不採用
+  many_trees: 3                      # 實驗的決策樹超過此數 → 每個待補版本補 placements_many_trees 片
+  placements_many_trees: 2           # 同一版本的各片必須在不同的樹
+  min_per_tree: 0                    # 每棵樹至少補幾片（優先於上面的片數；0 = 不要求）
+  force_coverage: false              # true：每棵樹、每個版本一定要補到，門檻內補不到就用門檻外的候選（標「超過門檻」）；
+                                     # every_version_per_tree 時只放寬可比區佔比，差距仍 ≤ max_loss_pp
+  every_version_per_tree: false      # true：以每棵樹計，該樹的葉子沒建議到的版本都在該樹內補一片（每棵樹都有每個版本）
+  sub_rule_depth: 2                  # 子規則最多幾個條件（葉子內小樹的深度）
+                                     # 可比區門檻、每個版本最少筆數沿用 leaf_eval 的 overlap_min、min_n_per_arm
+                                     # 變體的補位設定在 feel_engine/variants.py
+five_feelings_2:                     # 正式實驗頁的「五個體感2」分頁 = 上面的 five_feelings 再覆蓋這些值（2026-11-04 起；變體頁不產生）
+  every_version_per_tree: true       # 每棵樹都要有每個版本（「五個體感1」= 上面的設定：每個版本在整個實驗至少出現一次）
+  force_coverage: true               # 門檻內補不到時用可比區不足的候選（標「超過門檻」）；比原建議低超過 max_loss_pp 的位置仍不用

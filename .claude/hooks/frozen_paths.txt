@@ -1,0 +1,7 @@
+# Frozen／核心模組清單（.claude/hooks/frozen_guard.py 讀取）
+#
+# 每行一個相對於專案根目錄的路徑，支援 glob（例如 production/etl/steps/w6_*.py）。
+# 以 # 開頭的行視為註解，空白行忽略。
+#
+# 目前尚無模組被標記為 frozen。當某個模組確定要凍結時，在下面加一行即可，例如：
+# production/etl/steps/w6_player_game_tag_wi.py

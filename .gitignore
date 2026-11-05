@@ -1,0 +1,27 @@
+# 憑證（.env 目前在上一層資料夾，這裡也擋，避免日後誤放進專案）
+.env
+.env.*
+
+# 原始資料與中間產物（data 約 8 GB、output 約 1.4 GB，可由下載與 build 重建）
+data/
+output/
+result/
+*.ipynb
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Claude Code 個人設定（共用的 settings.json、agents、hooks、commands、skills 會推上去）
+.claude/settings.local.json
+
+# 系統與編輯器
+.DS_Store
+.vscode/
+
+# 紀錄
+logs/
+*.log
