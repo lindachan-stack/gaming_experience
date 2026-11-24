@@ -1,77 +1,61 @@
-# 決策樹（SPEC 第 8 節）的特徵與實驗設定
+# 決策樹（SPEC 第 8 節）的特徵與實驗設定。樹的超參數與分群門檻在 config.yaml 的 tree、splits。
 #
-# - 不要的欄位：在前面加 # 註解掉即可。
-# - 每個欄位寫成「欄位: 中文名稱」；中文名稱會用在實驗 HTML 的決策樹圖。
-# - 只能用 dataset.parquet 中 GP_／SY_／NGP_／TAG_ 開頭的欄位。
-#   索引、遊戲版本（arm、arm_ratio 用到之後 20 手）、SEG_、churnNext20、w_cap 不得放入（會報錯）。
-# - 數值欄位缺值 → missing.fill，並視 missing.add_isna 另加 <欄位>_isna；文字欄位（TAG_）自動 one-hot。
-# - 樹的超參數在 config.yaml 的 tree:；分群門檻、value 要建模的群在 config.yaml 的 splits:。
+# - 每個欄位寫成「欄位: 中文名稱」；中文名稱用在實驗 HTML 的樹圖與規則。不要的欄位在前面加 # 註解掉。
+# - 只能用 dataset 中 GP_／SY_／NGP_／TAG_ 開頭的欄位；索引、arm、arm_ratio、SEG_、churnNext20、w_cap 放入會報錯。
+# - 每個實驗的 X = fast ＋ tags[該實驗的 tags]。
+# - 特徵在決策點那一手「下注後、開獎前」計算，都不用當手的開獎結果。
+#   「今日」= 美東 0 點起、到當手之前的所有付費手（與遊戲端水池一致）；今日首手的比率類特徵是 0 ÷ 0 → 缺值。
 #
-# 執行：bash run_experiments.sh                         # 依下面 experiments 的順序全部跑完並比較
+# 執行：bash run_experiments.sh                                    # 依 experiments 的順序全部跑完並比較
 #      python -m feel_engine.cli run --split all --tags lifecycle   # 只跑一組
-# 每個實驗的 X = fast ＋ tags[該實驗的 tags]
-#
-# ── 特徵說明怎麼讀 ─────────────────────────────────────────────────────────────
-# 每個特徵後面的註解 = 意義｜回看範圍｜含不含當手
-#   決策點：每個 session 第 0、20、40… 手抽一筆（「20」只用在抽樣間隔、Y 與 arm 的窗口），
-#           特徵在決策點那一手「下注後、開獎前」計算，回看範圍不是只有 20 手。
-#   回看範圍：
-#     今日全部 = 美東 0 點起、到當手之前的所有付費手（今天玩 2,000 手就看 2,000 手；0 點重置，與遊戲端水池一致）
-#     session  = 本 session 第一手起、到當手之前（session 可跨午夜；相鄰付費手間隔 > 30 分鐘切開；
-#                起點被讀取範圍切到的 session 不抽決策點，見 SPEC 5.4）
-#     當手     = 決策點那一手開獎前已知的資訊（下注時間、下注額、下注前餘額、是否 BUY）；當手是否中 FreeGame 是開獎結果，不能用
-#   前綴：GP_ = 水池類，只用當手之前的手；SY_ = 系統端狀態（下注額、餘額、BUY）；NGP_ = 水池與系統端組合的衍生特徵。
-#         任何特徵都不用當手的開獎結果。
-#   缺值：今日首手（今日還沒有付費手）時，「今日全部」的比率類特徵是 0 ÷ 0 → 缺值。
 
 fast:                                          # 快層：每個實驗都放
-  # ── GP_：水池，只用當手之前的手 ──
-  - GP_dailySpinCount: 今日已玩手數               # 今日已玩付費手數｜今日全部｜不含當手
-  - GP_dailyRate_NO_WIN: 今日未中比例             # 今日沒中（0 倍）的比例｜今日全部｜不含當手
-  - GP_dailyRate_TINY_WIN: 今日小於1倍比例        # 今日中 0–1 倍的比例｜今日全部｜不含當手
-  - GP_dailyRate_SMALL_WIN: 今日1至7倍比例        # 今日中 1–7 倍的比例｜今日全部｜不含當手
-  - GP_dailyRate_MEDIUM_WIN: 今日7至30倍比例      # 今日中 7–30 倍的比例｜今日全部｜不含當手
-  - GP_dailyRate_BIG_WIN: 今日30倍以上比例        # 今日中 ≥ 30 倍的比例｜今日全部｜不含當手
-  - GP_dailyRtp: 今日RTP                        # 今日 Σ贏分 ÷ Σ下注（現行版本分派依此切換）｜今日全部｜不含當手
-  - GP_dailyRate_MEDIUM_PLUS: 今日7倍以上比例     # 今日中 ≥ 7 倍的比例（MEDIUM＋BIG）｜今日全部｜不含當手
-  - GP_dailyNoWin_x_spins: 今日未中比例×log手數   # 今日 NO_WIN 比例 × log1p(今日手數)｜今日全部｜不含當手
-  - GP_flag_dryLong: 今日久旱                    # 今日 ≥ 100 手且沒中過 ≥ 7 倍 → 1｜今日全部｜不含當手
-  - GP_dailyRate_FREE_GAME: 今日FreeGame比例     # 今日含 FreeGame（game_mode 位元 2，含 BUY 手）的手數比例｜今日全部｜不含當手
-  # ── SY_：系統端（含當手資訊） ──
-  - SY_bet: 當手下注額                           # 當手下注額｜當手｜含
-  - SY_isBuyFeature: 當手購買特色                # 當手是否購買特色（game_mode 19）｜當手｜含
-  - SY_balance: 當手下注前餘額                   # 當手下注前餘額｜當手｜含
-  - SY_balanceToBet: 當手下注前餘額÷當手下注額     # 當手下注前餘額 ÷ 當手下注額（還能玩幾手）｜當手｜含
-  - SY_first_balance: session起始餘額            # 本 session 第一手下注前餘額（整個 session 固定）｜session 第一手｜不含當手（session 第一手的決策點剛好等於當手）
-  # ── NGP_：水池與系統端組合（含當手資訊） ──
-  - NGP_dailyTotalWinToBet: 今日總贏分÷當手下注額   # 今日 Σ贏分（gamePotSave totalWin 的日版本，美東 0 點重置）÷ 當手下注額｜今日全部＋當手｜含（分母是當手下注額）
-  - NGP_flag_coldLoss: 手冷且虧損                # 今日 NO_WIN ≥ 80% 且當手下注前餘額比 session 起始少 ≥ 30% → 1｜今日全部＋session＋當手｜含
-  # - NGP_dailyNoWin_x_sessionLoss: 今日未中比例×session跌幅   # 今日 NO_WIN 比例 × max(0, 1 − 當手下注前餘額 ÷ session 起始餘額)｜今日全部＋session＋當手｜含
+  # ── GP_：水池，只用今日當手之前的手 ──
+  - GP_dailySpinCount: 今日已玩手數
+  - GP_dailyRate_NO_WIN: 今日未中比例             # 0 倍
+  - GP_dailyRate_TINY_WIN: 今日小於1倍比例
+  - GP_dailyRate_SMALL_WIN: 今日1至7倍比例
+  - GP_dailyRate_MEDIUM_WIN: 今日7至30倍比例
+  - GP_dailyRate_BIG_WIN: 今日30倍以上比例
+  - GP_dailyRtp: 今日RTP                        # Σ贏分 ÷ Σ下注（現行版本分派依此切換）
+  - GP_dailyRate_MEDIUM_PLUS: 今日7倍以上比例     # MEDIUM ＋ BIG
+  - GP_dailyNoWin_x_spins: 今日未中比例×log手數   # 未中比例 × log1p(今日手數)
+  # - GP_flag_dryLong: 今日久旱                    # 今日 ≥ 100 手且沒中過 ≥ 7 倍 → 1
+  - GP_dailyRate_FREE_GAME: 今日FreeGame比例     # 含 FreeGame 的手（game_mode 位元 2，含 BUY 手）
+  # ── SY_：系統端，當手開獎前已知 ──
+  - SY_bet: 當手下注額
+  - SY_isBuyFeature: 當手購買特色
+  - SY_balance: 當手下注前餘額
+  - SY_balanceToBet: 當手下注前餘額÷當手下注額     # 還能玩幾手
+  - SY_first_balance: session起始餘額            # 本 session 第一手下注前餘額
+  # ── NGP_：水池與系統端的組合 ──
+  - NGP_dailyTotalWinToBet: 今日總贏分÷當手下注額
+  # - NGP_flag_coldLoss: 手冷且虧損                # 今日未中 ≥ 80% 且餘額比 session 起始少 ≥ 30% → 1
 
-tags:                                    # 慢層組合（實驗的 TAG_ 維度）：名稱 → 加進 X 的欄位
-  none: []                               # TAG_ = 無：只用快層
+tags:                                    # 慢層組合：名稱 → 加進 X 的 TAG_ 欄位（決策週之前最新一筆週標籤）
+  none: []
   lifecycle:
-    - TAG_lifecycle: 生命週期                    # 流失／一般／新手／下滑／活躍／回流（無紀錄 → 新手）｜決策週之前最新一筆週標籤｜不含本週
+    - TAG_lifecycle: 生命週期                    # 流失／一般／新手／下滑／活躍／回流（無紀錄 → 新手）
   value:
-    - TAG_value_combined: 價值等級               # 只取低／中／高做 one-hot（見 categories）｜決策週之前最新一筆週標籤｜不含本週
-  lifecycle_value:                       # 生命週期＋價值都當特徵（2026-10-22 加）
+    - TAG_value_combined: 價值等級               # one-hot 只取低／中／高（見 categories）
+  lifecycle_value:
     - TAG_lifecycle: 生命週期
     - TAG_value_combined: 價值等級
   # 其他可用：TAG_source（標籤取自 W-1／更早／無紀錄）、TAG_is_zero_fill（取到的是否為補零列）
 
-experiments:                             # 要跑的實驗；順序 = 綜合比較表的順序
+experiments:                             # 要跑的實驗；順序 = 實驗比較的順序
   - {split: all,       tags: none}
   - {split: all,       tags: lifecycle}
   - {split: all,       tags: value}
-  - {split: all,       tags: lifecycle_value}   # 全部玩家一棵樹，生命週期＋價值都當特徵（2026-10-22 加）
+  - {split: all,       tags: lifecycle_value}
   - {split: lifecycle, tags: none}
   - {split: lifecycle, tags: value}
   - {split: value,     tags: none}       # value 分群只建模低／中／高（config.yaml splits.groups.value）
   - {split: value,     tags: lifecycle}
 
-categories:                              # 文字欄位只對列出的類別做 one-hot；未列出的類別全為 0，不會單獨成為分支條件
-  TAG_value_combined: [低, 中, 高]       # 無紀錄、本週無下注、手數過低不當節點
+categories:                              # 文字欄位只對列出的類別做 one-hot；其他類別全為 0，不會成為分支條件
+  TAG_value_combined: [低, 中, 高]
 
 missing:
-  fill: -1                               # 數值缺值填補值（SPEC 6.1）
-  add_isna: false                        # 有缺值的數值欄位另加 <欄位>_isna（0／1）；決策樹不需要，第 9 節的邏輯迴歸另行處理
+  fill: -1                               # 數值缺值填補值
+  add_isna: false                        # true：有缺值的數值欄位另加 <欄位>_isna（0／1）
