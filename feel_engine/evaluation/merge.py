@@ -122,7 +122,7 @@ def merge_recommendations(nodes: list[dict], collapsed: set[int], rec: dict[int,
 
 
 def recommended_version(row: dict | None) -> str | None:
-    """葉子建議的版本：高／中／低 → 最高留存版本；維持現狀_X → X（可和建議 X 的葉子合併，2026-10-20）；無法比較 → None。"""
+    """葉子建議的版本：高／中／低 → 最高留存版本；維持現狀_X → X（可和建議 X 的葉子合併）；無法比較 → None。"""
     if row is None:
         return None
     conf = pages.display_conf(row)

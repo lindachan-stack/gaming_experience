@@ -1,34 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-第 9 節：葉子 × arm 評估（只用驗證期間）→ 每片葉子留存率最高的 arm（體感模組版本）。
+第 9 節主流程：葉子 × arm 評估（只用驗證期間）→ 每片葉子留存率最高的 arm，每個實驗寫一頁 HTML。
 
-  9.1 傾向分數（所有實驗共用、只配適一次）：
-      p(arm | x)，x = 快層 ＋ 所有 TAG_ 標籤（含分群用的標籤）；依玩家 5 折交叉配適；sample_weight = w_cap。
-      模型（config leaf_eval.propensity_model）：logistic = 多項式邏輯迴歸（預設，用 design_matrix 的共變數）；
-      gbm = 梯度提升樹，從資料自動學版本分派的門檻與交互作用（數值保留原值與缺值、文字 one-hot）。
-      2026-10-12 實測 gbm 的權重較極端、有效樣本較少，配合 9.1b 校準後信心不如 logistic，所以預設 logistic。
-      結果模型（同樣只配適一次、依玩家交叉配適）：每個 arm 一個邏輯迴歸，用狀態 x 預測「拿到該 arm 時」的留存率 m_a(x)。
-  9.1a 共同範圍（2026-10-15 起，取代 propensity_min）：每片葉子挑要比較的 arm 組合 C，共同範圍 S = 葉子內
-      「C 的每個 arm 機率都 ≥ overlap_min」的決策點，C 的每個 arm 在 S 內都要 ≥ min_n_per_arm 筆。
-      盡量多比幾個 arm，但 S 要涵蓋葉子 ≥ min_overlap_share；沒有組合做得到 → 選涵蓋最多的（信心最多「低」）。
-      現行規則幾乎只給某版本的狀態（機率極低的那一邊）不拿來比，避免把「誰拿到」當成「版本效果」。
-  9.1b 葉子內校準（leaf_eval.balance_calibration）：S 內每個比較 arm，以 W = w_cap / p(實際 arm) 為起點調整權重，
-      讓該 arm 各共變數的加權平均與 S 相差 ≤ balance_tolerance 個標準差（近似 entropy balancing）；比 W 更平衡才採用。
-      對不齊時平衡檢查照實判未平衡。只用資料，不用遊戲端規則。
-  9.2 每片葉子 × arm：加權留存率 = 雙重穩健（DR）估計
-        = S 內 m_a 的 w_cap 加權平均 ＋ S 內實際拿到 a 者「y − m_a」的校準權重平均（y = 1 − churnNext20）；
-      max_smd（對 S）、有效樣本。最高留存 arm = 比較 arm 中加權留存率最高者；與次高、與臨時基準（n 最大的 arm）比較，
-      差距用玩家層級 Poisson(1) bootstrap（先聚合成「玩家 × 葉子 × arm」再以稀疏矩陣運算）。
-  合併：比較 arm 不到兩個（無法比較）的葉子，由下往上把父節點整個合併成一片葉子（合併後重挑共同範圍），重算 9.2，
-        直到每片葉子都可比較或合併到根（merge_incomparable）。
-  程式：9.1 在 propensity.py；9.1a–9.2 在 leaf_eval.py；合併在 merge.py；本檔為主流程。
+  檢查      run 的輸出要對得上目前的 dataset 與 model.yaml（stale_reason、unmatched_predictions）
+  9.1       傾向分數與結果模型：所有實驗共用、只配適一次（propensity.py）
+  9.1–9.2   每片葉子的共同範圍、葉子內校準、雙重穩健加權留存率、bootstrap、最高留存 arm 與信心（leaf_eval.py）
+  合併      無法比較的葉子併回父節點，再合併相近建議；每次合併後重算 9.2（merge.py）
+  9.4       五個體感補位，以「合併相近建議」為準（five.py）
 
 暫代模式（version_map 未填）：arm = game_version；不換算 M1–M7（第 10 節）。
-輸出：每個實驗一頁 result/{run}/{split}_tag_{tags}.html（原始葉子、合併無法比較、合併相近建議三個分頁；
-      config five_feelings.enabled 時再加五個體感分頁，9.4、evaluation/five.py；pages.experiment_page）：
-      正式實驗兩個分頁「五個體感1」（five_feelings）與「五個體感2」（five_feelings 再覆蓋 five_feelings_2，每棵樹都有每個版本）；
-      變體頁一個「五個體感」分頁（變體自己的設定）。
-      output/.../leaf_confidence.json（每片葉子的信心）、five_feelings.json／five_feelings_2.json（補位結果），
+輸出：result/{run}/{split}_tag_{tags}.html（分頁：原始葉子、合併無法比較的葉子、合併相近建議；
+      five_feelings.enabled 時再加五個體感分頁：正式實驗兩個「五個體感1」「五個體感2」，變體頁一個）；
+      output/.../leaf_confidence.json（每片葉子的信心）、five_feelings.json／five_feelings_2.json（補位結果）；
       最後重做 summary.html（AUC ＋ 信心分數）。
 """
 from __future__ import annotations
@@ -46,10 +29,46 @@ from feel_engine.evaluation.merge import (collapse_names, merge_incomparable, me
                                           recommended_version)
 from feel_engine.evaluation.propensity import KEY, Propensity, build_propensity
 from feel_engine.html import pages
+from feel_engine.modeling.model import feature_columns
 from feel_engine.paths import RunPaths, rel
 
 log = logging.getLogger("feel_engine.evaluation.evaluate")
 SIMPLIFY_ROUNDS = 10                              # 合併相近建議：合併 → 重算 → 再合併，最多幾輪
+
+
+class StaleOutputError(RuntimeError):
+    """run 的輸出（樹、驗證期間預測）對不上目前的 dataset，須重跑 run。"""
+
+
+# ---------------------------------------------------------------------------
+# evaluate 前的檢查：run 的輸出要對得上目前的 dataset 與 model.yaml
+# ---------------------------------------------------------------------------
+def stale_reason(rules: dict, mcfg: dict, tags: str, dataset_signature: str | None,
+                 regroup: dict | None = None) -> str | None:
+    """tree_rules.json（run 當時）與現在不一致的原因；一致 → None。
+
+    dataset：run 記下的簽章（store.dataset_signature）與現在不同 = run 之後有日子重建過，樹與預測是舊 dataset 的。
+             舊版輸出沒記簽章、或呼叫端沒給（變體：剛跑完就評估）→ 不比，改由 unmatched_predictions 逐筆把關。
+    regroup：config.yaml 的類別合併與 run 時不同（群名、TAG_ 類別對不上）；沒記的輸出 = 沒合併。
+    model.yaml：這個實驗的 X 欄位、缺值填補或 one-hot 類別與 run 時不同（傾向分數的共變數取自現在的 model.yaml）。
+    """
+    recorded = rules.get("dataset_signature")
+    if recorded and dataset_signature and recorded != dataset_signature:
+        return "dataset 在 run 之後重建過"
+    if (rules.get("regroup") or {}) != (regroup or {}):
+        return "config.yaml 的 regroup（類別合併）與 run 時不同"
+    now = (feature_columns(mcfg, tags) if tags in mcfg.get("tags", {}) else None, mcfg.get("missing"),
+           mcfg.get("categories") or {})
+    then = (rules.get("features"), rules.get("missing"), (rules.get("params") or {}).get("categories") or {})
+    if now != then:
+        return "model.yaml 的欄位、缺值或類別設定與 run 時不同"
+    return None
+
+
+def unmatched_predictions(pred: pd.DataFrame, valid: pd.DataFrame) -> int:
+    """驗證期間預測中，在目前 dataset 找不到的決策點筆數（> 0 = 預測是另一份 dataset 的）。"""
+    found = pred[KEY].merge(valid[KEY].drop_duplicates(), on=KEY, how="left", indicator=True)["_merge"]
+    return int((found != "both").sum())
 
 
 # ---------------------------------------------------------------------------
@@ -139,14 +158,27 @@ def prepare_evaluation(valid: pd.DataFrame, cfg: dict, mcfg: dict) -> tuple[pd.D
     return V, ps, ps.table.assign(_z=np.arange(len(ps.table))), pages.arm_colors(ps.arms)
 
 
-def evaluate_experiments(rp: RunPaths, cfg: dict, mcfg: dict, valid: pd.DataFrame, provisional: bool) -> list[Path]:
-    """對 model.yaml experiments 中已跑過決策樹的實驗，做第 9 節的葉子 × arm 評估，每個實驗寫一頁 HTML。"""
+def evaluate_experiments(rp: RunPaths, cfg: dict, mcfg: dict, valid: pd.DataFrame, provisional: bool,
+                         dataset_signature: str | None = None) -> list[Path]:
+    """對 model.yaml experiments 中已跑過決策樹的實驗，做第 9 節的葉子 × arm 評估，每個實驗寫一頁 HTML。
+
+    dataset_signature：目前 dataset 的簽章（store.dataset_signature）。任何一個實驗的輸出對不上目前的 dataset、
+    config.yaml 的 regroup 或 model.yaml（stale_reason）→ 全部不評估、回傳空清單（先重跑 run；在配適傾向分數之前就擋下）。"""
     if provisional:
         log.info("版本 = game_version（暫代，version_map 未填），尚未對應到體感模組 M1–M7")
     experiments = [(e["split"], e["tags"]) for e in mcfg["experiments"]]
     present = [k for k in experiments if rp.model_predictions(*k).exists() and rp.tree_rules(*k).exists()]
     if not present:
         log.warning("沒有任何實驗的 valid_predictions.parquet，請先執行 run")
+        return []
+    stale = {k: stale_reason(json.loads(rp.tree_rules(*k).read_text(encoding="utf-8")), mcfg, k[1], dataset_signature,
+                             cfg.get("regroup"))
+             for k in present}
+    if any(stale.values()):
+        for (split, tags), why in stale.items():
+            if why:
+                log.error("實驗 %s／%s 的樹與預測已過期：%s", split, _tag_label(tags), why)
+        log.error("請重跑 run（或 bash run_experiments.sh）後再 evaluate")
         return []
     V, ps, base, colors = prepare_evaluation(valid, cfg, mcfg)
     paths = []
@@ -162,7 +194,7 @@ def evaluate_experiments(rp: RunPaths, cfg: dict, mcfg: dict, valid: pd.DataFram
 def evaluate_experiment(rp: RunPaths, cfg: dict, split: str, tags: str, title: str, V: pd.DataFrame, ps: Propensity,
                         base: pd.DataFrame, colors: dict[str, str], extra_facts: tuple[str, ...] = (),
                         two_five_tabs: bool = False) -> Path:
-    """一個實驗（rp.model_predictions、rp.tree_rules 已存在）：9.1a–9.2、合併、五個體感；寫 leaf_confidence.json、
+    """一個實驗（rp.model_predictions、rp.tree_rules 已存在）：9.1–9.2、合併、五個體感；寫 leaf_confidence.json、
     five_feelings.json 與實驗頁 HTML，回傳 HTML 路徑。V、ps、base、colors 來自 prepare_evaluation；
     extra_facts：頁首多加的說明（HTML，排在最後）；two_five_tabs（正式實驗）且 config 有 five_feelings_2 →
     兩個分頁「五個體感1」「五個體感2」（後者另寫 five_feelings_2.json），否則一個「五個體感」分頁。"""
@@ -174,7 +206,11 @@ def evaluate_experiment(rp: RunPaths, cfg: dict, split: str, tags: str, title: s
     min_share = float(ff.get("min_comparable_share", 0.5))
 
     pred = pd.read_parquet(rp.model_predictions(split, tags), columns=[*KEY, "群", "樹", "葉子"])
-    df = pred.merge(base, on=KEY, how="inner")
+    lost = unmatched_predictions(pred, V)
+    if lost:                                      # 不靜默丟列：預測是另一份 dataset 的
+        raise StaleOutputError(f"實驗 {split}／{_tag_label(tags)}：{lost:,} 筆驗證期間預測在目前的 dataset 找不到"
+                               f"（共 {len(pred):,} 筆），請重跑 run")
+    df = pred.merge(base, on=KEY, how="inner")           # 只留 arm 已知的決策點（R4 的 arm 不明不評估）
     rules = json.loads(rp.tree_rules(split, tags).read_text(encoding="utf-8"))
     leaf_order = [l["葉子"] for t in rules["trees"].values() for l in t["leaves"]]
     stats_o, best_o, cis_o = evaluate_leaves(df, ps, le, seed, leaf_order)

@@ -29,7 +29,6 @@ from feel_engine.pipeline.build import (
 )
 from feel_engine.pipeline.data import (
     BUCKET_COLUMNS,
-    month_base_from_files,
     ET,
     TZ,
     DataCheckError,
@@ -89,9 +88,9 @@ def spin_series(times: list[datetime], **kw) -> list[dict]:
     return [{"ts": t, **kw} for t in times]
 
 
-def features_at(raw: pl.DataFrame, i: int, base: pl.DataFrame | None = None, **kw) -> dict:
+def features_at(raw: pl.DataFrame, i: int, **kw) -> dict:
     p = params(**kw)
-    spins, _ = build_spin_table(raw, p, base)
+    spins, _ = build_spin_table(raw, p)
     return add_features(spins, p).row(i, named=True)
 
 
@@ -172,19 +171,19 @@ def test_pool_features_example():
     expected = {
         "GP_dailySpinCount": 6, "GP_dailyRate_NO_WIN": 4 / 6, "GP_dailyRate_TINY_WIN": 1 / 6,
         "GP_dailyRate_SMALL_WIN": 0.0, "GP_dailyRate_MEDIUM_WIN": 1 / 6, "GP_dailyRate_BIG_WIN": 0.0, "GP_dailyRtp": 850 / 600,
-        "GP_dailyRate_MEDIUM_PLUS": 1 / 6, "GP_dailyNoWin_x_spins": 1.2973, "NGP_dailyNoWin_x_sessionLoss": 0.0,
+        "GP_dailyRate_MEDIUM_PLUS": 1 / 6, "GP_dailyNoWin_x_spins": 1.2973,
         "GP_flag_dryLong": 0, "NGP_flag_coldLoss": 0, "GP_dailyRate_FREE_GAME": 0.0,
         "SY_bet": 200, "SY_isBuyFeature": 0, "SY_first_balance": 10_000, "SY_balance": 10_250, "SY_balanceToBet": 51.25,
-        "GP_sessionMinutes": 6, "NGP_dailyTotalWinToBet": 4.25, "GP_rtp": 850 / 600,       # 每手間隔 1 分鐘
+        "NGP_dailyTotalWinToBet": 4.25,
     }
     for k, v in expected.items():
         assert f[k] == pytest.approx(v, abs=1e-4), k
-    assert set(expected) - {"GP_rtp"} == set(FEATURES)
+    assert set(expected) == set(FEATURES)
 
 
 def test_free_game_rate_uses_previous_spins_only():
     """第 3 手中 FreeGame → 第 6 手 1/6；當手（第 6 手）中 FreeGame 不改變任何特徵。"""
-    keys = [*FEATURES, "GP_rtp"]
+    keys = list(FEATURES)
     f = features_at(pool_raw(free_at=(3,)), 6)
     assert f["GP_dailyRate_FREE_GAME"] == pytest.approx(1 / 6)
     assert features_at(pool_raw(free_at=(3,)), 3)["GP_dailyRate_FREE_GAME"] == 0.0
@@ -196,8 +195,7 @@ def test_free_game_rate_uses_previous_spins_only():
 @pytest.mark.parametrize("last_prize", [0, 100_000])
 def test_features_only_use_previous_spins(last_prize):
     base, changed = features_at(pool_raw(), 6), features_at(pool_raw(last_prize), 6)
-    keys = [*FEATURES, "GP_rtp"]
-    assert {k: base[k] for k in keys} == {k: changed[k] for k in keys}
+    assert {k: base[k] for k in FEATURES} == {k: changed[k] for k in FEATURES}
 
 
 def test_gp_ignores_current_spin_ngp_uses_it():
@@ -209,8 +207,7 @@ def test_gp_ignores_current_spin_ngp_uses_it():
         is_buy=current,
     )
     f0, f1 = features_at(pool_raw(), 6), features_at(alt, 6)
-    gp = [*GP_FEATURES, "GP_rtp"]
-    assert {k: f0[k] for k in gp} == {k: f1[k] for k in gp}
+    assert {k: f0[k] for k in GP_FEATURES} == {k: f1[k] for k in GP_FEATURES}
     assert all(f0[k] != f1[k] for k in ("SY_bet", "SY_isBuyFeature", "SY_balance", "SY_balanceToBet",
                                          "NGP_dailyTotalWinToBet"))
 
@@ -225,26 +222,12 @@ def test_et_day_boundary(first, second, expected):
     assert features_at(raw, 1)["GP_dailySpinCount"] == expected
 
 
-def test_et_month_boundary():
-    times = [datetime(2026, 7, 31, 23, 50 + i, tzinfo=ET) for i in range(3)] + [datetime(2026, 8, 1, 0, 1, tzinfo=ET)]
-    f = features_at(make_raw(spin_series(times, prize=500)), 3, days=(date(2026, 8, 1),))
-    assert f["GP_rtp"] is None
-
-
-def test_month_base_added_to_guard_rtp_only():
-    base = pl.DataFrame({"member_account": ["p1"], "base_bet": [1_000], "base_prize": [1_200]})
-    f = features_at(pool_raw(), 6, base=base)
-    assert f["GP_rtp"] == pytest.approx(2_050 / 1_600, abs=1e-4)      # 1.2813
-    assert f["GP_dailyRtp"] == pytest.approx(850 / 600, abs=1e-4)     # 只算當天
-
-
 def test_multi_condition_flags():
     rows = [{"ts": T0 + timedelta(minutes=i), "prize": 0, "points": 10_000 if i == 0 else (6_000 if i == 120 else 9_000)}
             for i in range(121)]
     f = features_at(make_raw(rows), 120)
     assert f["GP_dailySpinCount"] == 120
     assert f["GP_flag_dryLong"] == 1 and f["NGP_flag_coldLoss"] == 1
-    assert f["NGP_dailyNoWin_x_sessionLoss"] == pytest.approx(0.4)
 
 
 def test_buy_spin_counts_in_pool_and_is_flagged():
@@ -262,7 +245,6 @@ def test_new_session_entry_balance():
     f = add_features(spins, p).filter(pl.col("session_id") == 2)
     assert f["SY_first_balance"].to_list() == [8_000] * 3
     assert f["session_spin_idx"].to_list() == [0, 1, 2]
-    assert f["GP_sessionMinutes"].to_list() == [0, 1, 2]                 # 新 session 從 0 分鐘起算
 
 
 # ---------------------------------------------------------------------------
@@ -353,35 +335,6 @@ def test_a_day_is_the_same_whether_built_alone_or_with_the_previous_day():
     assert alone.height == 3 + 3 + 2 and alone.equals(together)
     # session_id = yyyymmdd × 1000 ＋ 當天第幾個 session：p1 前一天 23:50 起的 session 歸 08-17，08-18 第 1、2 個是 10:00、13:00
     assert sorted(set(alone.filter(pl.col("member_account") == "p1")["session_id"].to_list())) == [20260818001, 20260818002]
-
-
-def test_month_rtp_is_the_same_whatever_the_read_range_start():
-    """範圍起點前的付費手、其免費列落在範圍內（R6，範圍內併不進任何一手）→ 贏分加回月初基準，GP_rtp 與範圍起點無關。"""
-    paid = datetime(2026, 8, 17, 17, 59, tzinfo=ET)
-    rows = [{"ts": paid, "bet_points": 100, "prize": 0},
-            {"ts": paid + timedelta(minutes=2), "bet_points": 0, "prize": 500},     # 免費列，在 18:00 之後
-            {"ts": T0, "bet_points": 100, "prize": 0}]
-    long_range = features_at(make_raw(rows), 1, data_end=T0 + timedelta(days=3))["GP_rtp"]
-    range_start = datetime(2026, 8, 17, 18, 0, tzinfo=ET)                       # DAY 0 點 − 6h：付費手在範圍外
-    base = pl.DataFrame({"member_account": ["p1"], "base_bet": [100], "base_prize": [0]})   # 範圍外那一手
-    short = make_raw([r for r in rows if r["ts"] >= range_start])
-    short_range = features_at(short, 0, base, data_end=T0 + timedelta(days=3))["GP_rtp"]
-    assert long_range == short_range == pytest.approx(5.0)
-
-
-def test_month_base_skips_free_rows_of_last_months_spin(tmp_path):
-    """月初基準：窗口內第一個付費手之前的免費列屬於上個月那一手（不計入）；之後的免費列、隔天檔的列都計入。"""
-    t = datetime(2026, 9, 1, 4, 5)                                            # UTC naive；9/1 美東 00:05
-    day1 = pl.DataFrame({"member_account": ["a", "a", "a", "b"], "create_at": [t, t + timedelta(minutes=1), t + timedelta(minutes=2), t],
-                         "bet_points": [0, 100, 0, 0], "prize": [900, 50, 30, 70]})    # a 的 900、b 的 70：8/31 那一手的免費卡
-    day2 = pl.DataFrame({"member_account": ["a", "b", "b"], "create_at": [t + timedelta(days=1)] * 3,
-                         "bet_points": [0, 0, 100], "prize": [5, 7, 0]})              # a 已有付費手 → 5 計入；b 的 7 仍在第一手之前
-    day1.write_parquet(tmp_path / "d1.parquet")
-    day2.write_parquet(tmp_path / "d2.parquet")
-    start = datetime(2026, 9, 1, 4, 0, tzinfo=timezone.utc)
-    got = month_base_from_files([tmp_path / "d1.parquet", tmp_path / "d2.parquet"], start, start + timedelta(days=5))
-    assert {r["member_account"]: (r["base_bet"], r["base_prize"]) for r in got.iter_rows(named=True)} == {
-        "a": (100, 85), "b": (100, 0)}
 
 
 def test_stats_by_day_add_up_to_totals():
@@ -487,14 +440,22 @@ def test_read_plan_for_0829():
     assert plan.range_end == datetime(2026, 8, 31, 12, 0, tzinfo=ET)       # 24:00 ＋ 跨午夜 12h ＋ Y 的 24h
     assert plan.range_start.astimezone(timezone.utc).hour == 22
     assert plan.range_days == tuple(date(2026, 8, d) for d in (28, 29, 30, 31))
-    assert plan.base_days == tuple(AUG[:28])
     assert not plan.back_short
 
 
 def test_read_plan_covers_train_and_valid_days_in_one_range():
     plan = plan_read(date(2026, 8, 28), date(2026, 8, 29), 6, 24, AUG, post_hours=12)
     assert (plan.range_start, plan.range_end) == (datetime(2026, 8, 27, 18, 0, tzinfo=ET), datetime(2026, 8, 31, 12, 0, tzinfo=ET))
-    assert plan.range_days == tuple(date(2026, 8, d) for d in (27, 28, 29, 30, 31)) and plan.base_days == tuple(AUG[:27])
+    assert plan.range_days == tuple(date(2026, 8, d) for d in (27, 28, 29, 30, 31))
+
+
+def test_read_plan_front_only_needs_the_read_range():
+    """R7 前段：快取只要涵蓋讀取範圍起點（不必從當月 1 日起）。"""
+    late = AUG[20:]                                                       # 快取從 8/21 起
+    plan = plan_read(date(2026, 8, 29), date(2026, 8, 29), 6, 24, late, post_hours=12)
+    assert plan.range_days == tuple(date(2026, 8, d) for d in (28, 29, 30, 31))
+    with pytest.raises(DataCheckError, match="前段"):
+        plan_read(date(2026, 8, 21), date(2026, 8, 21), 6, 24, late, post_hours=12)   # 範圍起點 8/20 18:00 不在快取
 
 
 def test_read_plan_0831_aborts():
@@ -596,4 +557,5 @@ def test_dataset_column_naming_and_order():
     groups = [p if (p := c.split("_")[0]) in ("GP", "SY", "NGP", "TAG", "SEG") else "-" for c in DATASET_COLUMNS]
     runs = [g for i, g in enumerate(groups) if i == 0 or g != groups[i - 1]]
     assert [g for g in runs if g != "-"] == ["GP", "SY", "NGP", "TAG", "SEG"]   # 每個前綴各自連續、依此順序
+    assert [c for c, g in zip(DATASET_COLUMNS, groups) if g in ("GP", "SY", "NGP")] == list(FEATURES)   # 快層只有 FEATURES
     assert "dom_share" not in DATASET_COLUMNS and "arm_ratio" in DATASET_COLUMNS

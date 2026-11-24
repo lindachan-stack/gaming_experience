@@ -6,7 +6,7 @@
   排序依 model.yaml 的 experiments，清單外的結果附在最後並標示。
 - 共同樣本：每個實驗都有預測的驗證期間決策點（value 只建模低／中／高時，共同樣本就是這三群），在同一批決策點上比較。
 - AUC 以 w_cap 加權；95% 區間與「與基準（split = all、TAG_ = 無）差」用玩家層級 Poisson(1) bootstrap，
-  所有實驗共用同一組重抽權重；差的區間不含 0 才寫「較佳／較差」，否則「無顯著差異」（SPEC 11.2）。
+  所有實驗共用同一組重抽權重；差的區間不含 0 才寫「較佳／較差」，否則「無顯著差異」（SPEC 8.2）。
 - 信心分數（evaluate 之後才有）：共同樣本中（維持現狀的葉子不計入），落在信心高／中／低／無法比較葉子的決策點佔比
   （w_cap 加權），分數 = 100 × (高佔比 + 0.5 × 中佔比)；原始葉子與合併後各算一次（CONF_POINTS），summary 只顯示合併後。
 """
@@ -27,9 +27,8 @@ log = logging.getLogger("feel_engine.html.compare")
 PLAYER = "member_account"
 KEY = [PLAYER, "spin_ts"]
 BASELINE = ("all", "none")
-CONF_POINTS = {"高": 1.0, "中": 0.5, "低": 0.0, "無法比較": 0.0}   # 信心分數的給分；維持現狀的葉子不計入
+CONF_POINTS = {"高": 1.0, "中": 0.5, "低": 0.0, "無法比較": 0.0}   # 信心分數的給分（依據見 SPEC 8.2）；維持現狀的葉子不計入
 CONF_LEVELS = tuple(CONF_POINTS)
-                                                                    # 評分依據見 summary.html、SPEC 8.2
 
 
 def tag_label(tags: str) -> str:

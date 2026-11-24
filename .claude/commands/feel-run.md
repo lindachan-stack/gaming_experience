@@ -9,7 +9,7 @@ argument-hint: [check | build | run [<split> <tags>] | compare]（不給參數 =
 |---|---|
 | `check`（預設） | `python -m pytest -q feel_engine/tests`，再執行 `test.ipynb`（全部 cell），回報測試數與 ✅／❌ 檢查數 |
 | `build` | `python -m feel_engine.cli build --provisional-arm`（只建本 run 缺的或過期的日子，已建好的沿用；version_map 已填則不加 `--provisional-arm`），接著做 `check` |
-| `run` | `bash run_experiments.sh`：跑 `model.yaml` 的 experiments 全部（7 組，訓練期間長樹、驗證期間評估）＋ 第 9 節 evaluate |
+| `run` | `bash run_experiments.sh`：跑 `model.yaml` 的 experiments 全部（訓練期間長樹、驗證期間評估）＋ 第 9 節 evaluate |
 | `run <split> <tags>` | `python -m feel_engine.cli run --split <split> --tags <tags>`（可逗號分隔，跑所有組合） |
 | `compare` | `python -m feel_engine.cli compare` |
 | `evaluate` | `python -m feel_engine.cli evaluate`：每個實驗一頁 HTML（決策樹、葉子 × 版本留存率、信心） |

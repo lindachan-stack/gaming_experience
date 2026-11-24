@@ -10,20 +10,23 @@
 所以不同 run 可以共用同一天。下列任一項改變時該日視為過期，build 會重建：
   指紋 = build 相關設定（data.pre_hours、post_hours、labels、weighting、features.derived、modules.version_map）
          ＋ pipeline/data.py、build.py 的程式內容；
-  注單快取中用到的日檔列數、或標籤快取中用到的週有變（重抓過）。
+  注單快取中用到的日檔列數、或標籤快取中用到的週有變（重抓過）；
+  建置時注單快取尾端不足（R7 後段不足，該日有 session 因看不完 Y 被截掉），而現在的快取已經補上。
 """
 from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
 
 from feel_engine.paths import PACKAGE_DIR, StorePaths, bet_records_dir, rel, tag_dir
+from feel_engine.pipeline.data import et_midnight
 
 OK = "ok"
+TAIL_FILLED = "建置時注單快取尾端不足，現已補上"
 FINGERPRINT_CODE = (PACKAGE_DIR / "pipeline" / "data.py", PACKAGE_DIR / "pipeline" / "build.py")
 
 
@@ -90,6 +93,8 @@ def day_status(cfg: dict, store: StorePaths, days: list[date]) -> dict[date, str
     metas = day_metas(store, days)
     builds = build_metas(store, {m["build_id"] for m in metas.values()})
     raw_now, tags_now = current_raw_rows(cfg), current_tag_weeks(cfg)
+    cache_end = (datetime.combine(max(date.fromisoformat(k) for k in raw_now) + timedelta(days=1), dtime.min, tzinfo=timezone.utc)
+                 if raw_now else None)                    # 注單快取目前的終點（UTC，不含）
     out = {}
     for d in days:
         m = metas.get(d)
@@ -105,9 +110,33 @@ def day_status(cfg: dict, store: StorePaths, days: list[date]) -> dict[date, str
             out[d] = "注單快取已重抓"
         elif any(tags_now.get(w) != v for w, v in b["tag_weeks"].items() if w == m.get("tag_week")):
             out[d] = "標籤快取已重抓"
+        elif _tail_now_available(cfg, d, b, cache_end):
+            out[d] = TAIL_FILLED
         else:
             out[d] = OK
     return out
+
+
+def _tail_now_available(cfg: dict, d: date, build: dict, cache_end: datetime | None) -> bool:
+    """該日建置時注單快取的尾端不足（看不完 Y 的 session 整段不抽，5.3），而現在的快取比當時長 → 重建會多出決策點。
+
+    該日需要讀到「隔天美東 0 點 ＋ post_hours ＋ return_window」；build 的 data_end 比它早才算被截尾。
+    快取沒有變長時重建結果相同，不判過期。"""
+    plan = build["stage1"].get("read_plan") or {}
+    if not plan.get("back_short") or cache_end is None:
+        return False
+    data_end = datetime.fromisoformat(plan["data_end"])
+    need = et_midnight(d + timedelta(days=1)) + timedelta(
+        hours=float(cfg["data"].get("post_hours", 0)) + float(cfg["labels"]["return_window_hours"]))
+    return data_end < need and cache_end > data_end
+
+
+def dataset_signature(store: StorePaths, days: list[date]) -> str:
+    """這些日子目前的 dataset 是哪一份：每天的 build 與列數的指紋。任一天重建（即使內容相同）就會變；
+    run 記在 tree_rules.json，evaluate 比對，避免拿舊的樹與預測配上重建後的 dataset。"""
+    metas = day_metas(store, days)
+    parts = [(str(d), metas[d]["build_id"], metas[d]["rows"]) if d in metas else (str(d), None, None) for d in sorted(days)]
+    return hashlib.sha256(json.dumps(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def check_days(cfg: dict, store: StorePaths, days: list[date]) -> list[str]:

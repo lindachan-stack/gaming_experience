@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""實驗的變體（feel_engine/variants.py）：分群改名、加標籤、輸出路徑（合成資料，不讀快取）。"""
+"""實驗的變體（feel_engine/variants.py）：加標籤、輸出路徑（合成資料，不讀快取）。"""
 from __future__ import annotations
 
 import pandas as pd
@@ -7,12 +7,6 @@ import polars as pl
 
 import feel_engine.paths as paths
 from feel_engine import variants
-
-
-def test_regroup_renames_segment_only():
-    df = pd.DataFrame({"SEG_lifecycle": ["流失", "回流", "新手"], "TAG_lifecycle": ["流失", "回流", "新手"]})
-    out = variants.regroup(df, {"SEG_lifecycle": {"流失": "回流"}})
-    assert out["SEG_lifecycle"].tolist() == ["回流", "回流", "新手"] and out["TAG_lifecycle"].tolist() == ["流失", "回流", "新手"]
 
 
 def test_attach_tags_takes_latest_before_decision_week(tmp_path, monkeypatch):

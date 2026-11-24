@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-實驗的變體：改分群、補位規則或加標籤後，另外產生一頁 HTML 與正式實驗並排比較
+實驗的變體：改補位規則或加標籤後，另外產生一頁 HTML 與正式實驗並排比較
 （不在 model.yaml 清單、不進 summary.html、不覆蓋正式結果；在專案根目錄執行）：
 
   python -m feel_engine.variants new                       # → result/{run}/lifecycle_tag_none_new.html
   python -m feel_engine.variants alltags                   # → result/{run}/all_tag_alltags.html
   python -m feel_engine.variants alltags --config my.yaml  # 換訓練期間／驗證期間（run 依 config 的 data）
 
-流程與正式實驗相同（讀逐日 dataset → fit_split → 第 9 節評估），變體只改：
-  segments      ：分群欄位（SEG_）的值改名，例如流失併入回流 → 兩群同一棵樹；TAG_ 不動，所以傾向分數與 X 不變
+流程與正式實驗相同（讀逐日 dataset、套用 config.yaml 的 regroup → fit_split → 第 9 節評估），變體只改：
   extra_tags    ：標籤表的其他類別欄位，依 build 同樣的規則加進 dataset（決策週之前最新一筆週標籤；沒有紀錄 → 無紀錄）
   tag_set       ：這個變體的 TAG_ 組合（X = 快層 ＋ tag_set）；傾向分數仍用 model.yaml 的標籤，與正式實驗相同
   five_feelings ：覆蓋 config.yaml 的 five_feelings
@@ -44,12 +43,11 @@ EXTRA_TAGS = {                                     # 標籤表欄位 → (datase
 }
 
 VARIANTS = {
-    "new": {                                       # 週期的回流＋流失合成一個標籤、重建一棵樹（2026-11-02 起用原 new2 的補位條件）；
-        "split": "lifecycle", "tags": "none", "suffix": "new",   # 補位：每棵樹都要有每個版本，但差距超過 max_loss_pp（2 pp）的位置不用
-        "segments": {"SEG_lifecycle": {"流失": "回流"}},
+    "new": {                                       # 實驗 5，補位改為每棵樹都要有每個版本
+        "split": "lifecycle", "tags": "none", "suffix": "new",
         "five_feelings": {"every_version_per_tree": True, "force_coverage": True},
-        "title": "實驗 5 新版：lifecycle／無（流失併入回流、每棵樹都有每個版本、差距 ≤ 2 pp）",
-        "changes": "生命週期的「流失」併入「回流」（兩群合成一棵樹，其他群的樹不變）；五個體感改為每棵樹都要有每個版本："
+        "title": "實驗 5 新版：lifecycle／無（每棵樹都有每個版本、差距 ≤ 2 pp）",
+        "changes": "五個體感改為每棵樹都要有每個版本："
                    "這棵樹的葉子沒建議到的版本，都在這棵樹內補一片子規則，門檻內補不到時可用可比區不足的候選（標「超過門檻」），"
                    "但補位版本比原建議版本留存率低超過 2 pp 的位置一律不用（寧可那棵樹缺這個版本）",
         "compare": [("lifecycle", "none")],
@@ -65,11 +63,6 @@ VARIANTS = {
         "compare": [("all", "none"), ("all", "lifecycle_value")],
     },
 }
-
-
-def regroup(df: pd.DataFrame, segments: dict[str, dict[str, str]]) -> pd.DataFrame:
-    """分群欄位的值改名（只改 SEG_）。"""
-    return df.assign(**{col: df[col].astype(str).replace(m) for col, m in segments.items()})
 
 
 def attach_tags(df: pd.DataFrame, cfg: dict, columns: list[str]) -> pd.DataFrame:
@@ -141,15 +134,14 @@ def run_variant(name: str, config=CONFIG_PATH, model_config=MODEL_CONFIG_PATH) -
     train, valid = loaded
     if spec.get("extra_tags"):
         train, valid = (attach_tags(d, cfg, spec["extra_tags"]) for d in (train, valid))
-    if spec.get("segments"):
-        train, valid = (regroup(d, spec["segments"]) for d in (train, valid))
     fit_mcfg = copy.deepcopy(mcfg)                 # 傾向分數仍用 mcfg（與正式實驗相同的共變數）
     if spec.get("tag_set"):
         fit_mcfg["tags"][tags] = list(spec["tag_set"])
         fit_mcfg["labels"].update({col: label for col, label in EXTRA_TAGS.values()})
 
     res = fit_split(train, valid, split, tags, cfg, fit_mcfg)
-    write_split_outputs(res, vp.model_dir(split, tags), fit_mcfg, vp.model_predictions(split, tags), model_config)
+    write_split_outputs(res, vp.model_dir(split, tags), fit_mcfg, vp.model_predictions(split, tags), model_config,
+                        regroup=cfg.get("regroup"))
     log.info("變體 %s：%d 棵樹（%s），驗證期間加權 AUC %.4f", name, len(res.trees), "、".join(res.trees), res.auc_valid)
 
     vcfg = copy.deepcopy(cfg)

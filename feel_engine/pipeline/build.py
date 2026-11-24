@@ -4,20 +4,18 @@
 
 每桶依序：
   ① merge_free_spins      逐手序列：排序、併入免費局（5.1）
-  ② add_pool_state        逐手狀態：日水池、當月（含月初基準）、session（5.2）   ┐ 在完整序列上計算
+  ② add_pool_state        逐手狀態：日水池（5.2）                                ┐ 在完整序列上計算
   ③ add_sessions          session 表與 Y、截尾、窗口主版本（5.3、5.4）           ┘
-  ④ select_decisions      抽決策點：session 起點在訓練期間或驗證期間（session_date）、未截尾、主版本 ≥ arm_dominance（5.4）
+  ④ select_decisions      抽決策點：session 起點在本次 build 的日子、未截尾、主版本 ≥ arm_dominance（5.4）
   ⑤ add_weights           附加 w_cap，不刪列（5.5）
-  ⑥ add_features          快層特徵 + 當月 RTP GP_rtp（目前不使用；第 6 節）
+  ⑥ add_features          快層特徵（第 6 節）
 合併後：attach_tags        每個決策點取該玩家 week_index < W 的最新一筆標籤、分群欄位（7、8.1）
-→ 依 session_date 一天一檔寫入逐日 dataset（store.py），同一天只存一份、所有 run 共用。
+→ 依 session_date 一天一檔寫入逐日 dataset（store.py）。
 ③ 之後只篩選列或附加欄位，不平移、不重算（5.0）。
 
-一次 build 處理一段連續的日子（一份 session 表），決策點的 session_date（session 起點的美東日期）決定它屬於哪一天；
-跨午夜的 session 整段歸起點那天。一天的決策點與 build 一次建幾天無關（截尾以該日為準、session_id 含日期），
-run 再依 train_start～train_end → 訓練、valid_start～valid_end → 驗證 取用。
-dataset 欄位命名：索引在前；快層 GP_（只用當手之前）／NGP_（含當手開獎前資訊）、慢層 TAG_、分群 SEG_；
-遊戲版本 game_version、arm、arm_ratio；Y／權重 churnNext20、w_cap。順序見 DATASET_COLUMNS。
+一次 build 處理一段連續的日子；決策點的 session_date（session 起點的美東日期）決定它屬於哪一天，跨午夜的 session
+整段歸起點那天。一天的決策點與 build 一次建幾天無關（截尾以該日為準、session_id 含日期）。
+dataset 欄位順序見 DATASET_COLUMNS。
 """
 from __future__ import annotations
 
@@ -48,7 +46,7 @@ PLAYER = "member_account"
 NA_ARM = "<NA>"
 
 # 快層（第 6 節）
-#   GP_ ：水池類，只用當手之前的手（含 session 已玩時間）
+#   GP_ ：水池類，只用當手之前的手
 #   SY_ ：系統端狀態：當手下注額、是否 BUY、下注前餘額、餘額 ÷ 下注額、session 起始餘額
 #   NGP_：由水池與系統端組合的衍生特徵（用到當手開獎前資訊）
 GP_FEATURES = (
@@ -59,7 +57,6 @@ GP_FEATURES = (
     "GP_dailyRate_MEDIUM_PLUS",                       # 6.3 交互作用與多條件
     "GP_dailyNoWin_x_spins",
     "GP_flag_dryLong",
-    "GP_sessionMinutes",                              # 6.4 本 session 已玩分鐘數
 )
 SY_FEATURES = (
     "SY_bet",                                         # 當手下注額
@@ -71,15 +68,13 @@ SY_FEATURES = (
 NGP_FEATURES = (
     "NGP_dailyTotalWinToBet",                         # 今日總贏分（gamePotSave totalWin 的日版本，到當手之前）÷ 當手下注額
     "NGP_flag_coldLoss",
-    "NGP_dailyNoWin_x_sessionLoss",                   # 今日 NO_WIN 比例 × session 跌幅
 )
-FEATURES = (*GP_FEATURES, *SY_FEATURES, *NGP_FEATURES)   # 可放進決策樹的快層欄位（實際放哪些見 model.yaml）
-GUARD_FEATURES = ("GP_rtp",)
+FEATURES = (*GP_FEATURES, *SY_FEATURES, *NGP_FEATURES)   # = model.yaml fast 列出的欄位（含註解掉、暫不放進 X 的）
 LABEL_COLUMNS = ("churnNext20", "w_cap")
 # 分桶中間檔；week_start 只供 attach_tags 合併標籤，不進 dataset
 PART_COLUMNS = (
     PLAYER, "spin_ts", "session_date", "session_id", "session_spin_idx", "week_start",
-    "game_version", "arm", "arm_ratio", *FEATURES, *GUARD_FEATURES, *LABEL_COLUMNS,
+    "game_version", "arm", "arm_ratio", *FEATURES, *LABEL_COLUMNS,
 )
 SESSION_ID_STRIDE = 1000      # dataset 的 session_id = session_date（yyyymmdd）× 1000 ＋ 該玩家當天第幾個 session
 
@@ -88,15 +83,14 @@ TAG_READ_COLUMNS = ("member_account", "week_index", "is_zero_fill", "lifecycle_t
 NEW_PLAYER_LIFECYCLE = "新手"
 NO_RECORD_VALUE = "無紀錄"
 TAG_SOURCE_PREV, TAG_SOURCE_OLDER, TAG_SOURCE_NONE = "W-1", "更早", "無紀錄"
-TAG_FEATURES = ("TAG_lifecycle", "TAG_value_combined")    # 慢層：stage 1 加前者、stage 2 再加後者（第 7 節）
+TAG_FEATURES = ("TAG_lifecycle", "TAG_value_combined")    # 可放進 X 的慢層欄位（第 7 節）
 TAG_COLUMNS = (*TAG_FEATURES, "TAG_source", "TAG_week_index", "TAG_is_zero_fill")
 SEG_COLUMNS = ("SEG_lifecycle", "SEG_value")              # split = lifecycle／value（8.1）
 
 # dataset 欄位順序：索引 → 遊戲版本 → 快層（GP_ → SY_ → NGP_）→ 慢層（TAG_）→ 分群（SEG_）→ Y／權重
 INDEX_COLUMNS = (PLAYER, "spin_ts", "session_date", "session_id", "session_spin_idx", "week_index")
 VERSION_COLUMNS = ("game_version", "arm", "arm_ratio")
-DATASET_COLUMNS = (*INDEX_COLUMNS, *VERSION_COLUMNS, *GP_FEATURES, *GUARD_FEATURES, *SY_FEATURES, *NGP_FEATURES,
-                   *TAG_COLUMNS, *SEG_COLUMNS, *LABEL_COLUMNS)
+DATASET_COLUMNS = (*INDEX_COLUMNS, *VERSION_COLUMNS, *FEATURES, *TAG_COLUMNS, *SEG_COLUMNS, *LABEL_COLUMNS)
 
 log = logging.getLogger("feel_engine.pipeline.build")
 
@@ -123,12 +117,6 @@ class BuildParams:
         if self.provisional_arm:
             return tuple(sorted(self.version_map))
         return tuple(sorted({v for v in self.version_map.values() if v is not None}))
-
-    @property
-    def base_month(self) -> int:
-        """月初基準加在哪個月（= 第一天所在月份；讀取範圍內跨月時，下個月從 1 日 0 點在範圍內重新累計）。"""
-        first = min(self.days)
-        return first.year * 100 + first.month
 
 
 def params_from_config(cfg: dict, meta: dict, provisional_arm: bool) -> BuildParams:
@@ -241,40 +229,24 @@ def attach_arm(spins: pl.DataFrame, version_map: dict, provisional: bool) -> pl.
 # ---------------------------------------------------------------------------
 # ② 逐手狀態
 # ---------------------------------------------------------------------------
-def add_pool_state(spins: pl.DataFrame, base: pl.DataFrame | None, base_month: int) -> pl.DataFrame:
-    """第 i 手的狀態只累計同週期內第 i − 1 手（含）以前的付費手（5.2）；含 FreeGame 手數同樣不含當手。
+def add_pool_state(spins: pl.DataFrame) -> pl.DataFrame:
+    """第 i 手的狀態只累計同一美東日內第 i − 1 手（含）以前的付費手（5.2）；含 FreeGame 手數同樣不含當手。
 
-    「累計到本手 − 本手」等同「shift(1) 後依週期分組累計」，單次掃描。
-    當月 Σbet、Σprize = 月初基準（只加在 base_month）＋ 範圍內累計。
+    「累計到本手 − 本手」等同「shift(1) 後依日分組累計」，單次掃描。
     """
     day = [PLAYER, "et_date"]
-    month = [PLAYER, "et_month"]
     spins = spins.with_columns(
         et_date=pl.col("spin_ts").dt.date(),
-        et_month=pl.col("spin_ts").dt.year() * 100 + pl.col("spin_ts").dt.month(),
         **{f"is_{o}": (pl.col("outcome") == o).cast(pl.Int64) for o in OUTCOMES},
         is_FREE_GAME=pl.col("is_free").cast(pl.Int64),
     )
     before = lambda col, keys: pl.col(col).cum_sum().over(keys) - pl.col(col)  # noqa: E731
-    spins = spins.with_columns(
+    return spins.with_columns(
         st_d_count=pl.int_range(pl.len()).over(day),
         st_d_bet=before("bet", day),
         st_d_prize=before("prize", day),
-        st_m_bet=before("bet", month),
-        st_m_prize=before("prize", month),
         **{f"st_d_{o}": before(f"is_{o}", day) for o in OUTCOMES},
         st_d_FREE_GAME=before("is_FREE_GAME", day),
-    )
-    if base is None or base.height == 0:
-        return spins
-    in_month = pl.col("et_month") == base_month
-    return (
-        spins.join(base, on=PLAYER, how="left", maintain_order="left")
-        .with_columns(
-            st_m_bet=pl.col("st_m_bet") + pl.when(in_month).then(pl.col("base_bet").fill_null(0)).otherwise(0),
-            st_m_prize=pl.col("st_m_prize") + pl.when(in_month).then(pl.col("base_prize").fill_null(0)).otherwise(0),
-        )
-        .select(pl.exclude("base_bet", "base_prize"))
     )
 
 
@@ -323,8 +295,6 @@ def add_sessions(spins: pl.DataFrame, p: BuildParams, pre_last: pl.DataFrame | N
     spins = spins.with_columns(
         session_spin_idx=pl.int_range(pl.len()).over(sess_keys),
         st_session_start_balance=pl.col("balance_before").first().over(sess_keys),
-        # 本 session 已玩分鐘數 = 當手時間 − session 第一手時間（遊戲端 gamePotSave 有時間可算）
-        st_session_minutes=(pl.col("spin_ts") - pl.col("spin_ts").first().over(sess_keys)).dt.total_seconds() / 60,
     )
     cut_players = pl.Series(PLAYER, [], dtype=pl.String)
     if pre_last is not None and pre_last.height:
@@ -368,43 +338,25 @@ def add_sessions(spins: pl.DataFrame, p: BuildParams, pre_last: pl.DataFrame | N
     return add_window_dominance(spins, p.arms, w)
 
 
-def build_spin_table(raw: pl.DataFrame, p: BuildParams, base: pl.DataFrame | None = None,
+def build_spin_table(raw: pl.DataFrame, p: BuildParams,
                      pre_last: pl.DataFrame | None = None) -> tuple[pl.DataFrame, dict]:
     """①②③：回傳（含狀態與 Y 的完整逐手表, 併入免費局的統計）。"""
     spins, merge_stats = merge_free_spins(raw, p.session_gap)
     spins = attach_arm(spins, p.version_map, p.provisional_arm)
-    spins = add_pool_state(spins, with_orphan_prize(base, raw), p.base_month)
+    spins = add_pool_state(spins)
     return add_sessions(spins, p, pre_last), merge_stats
-
-
-def with_orphan_prize(base: pl.DataFrame | None, raw: pl.DataFrame) -> pl.DataFrame | None:
-    """月初基準加上 R6 免費列的贏分：讀取範圍內、玩家第一個付費手之前的免費列，併入的是範圍起點前最後一個付費手，
-    範圍內併不進任何一手；讀取範圍較早開始時它們會計入那一手的月份。那一手在基準月份（玩家在基準窗口有付費手，
-    base_bet > 0）才加回，GP_rtp 才與範圍起點無關；否則那一手在上個月，不加。"""
-    if base is None or base.height == 0:
-        return base
-    first_paid = raw.filter(pl.col("bet_points") > 0).group_by(PLAYER).agg(first_seq=pl.col("seq").min())
-    orphan = (raw.join(first_paid, on=PLAYER, how="inner")
-              .filter(pl.col("seq") < pl.col("first_seq"))
-              .group_by(PLAYER).agg(orphan_prize=pl.col("prize").sum()))
-    return (base.join(orphan, on=PLAYER, how="left")
-            .with_columns(base_prize=pl.col("base_prize") + pl.when(pl.col("base_bet") > 0)
-                          .then(pl.col("orphan_prize").fill_null(0)).otherwise(0))
-            .select(PLAYER, "base_bet", "base_prize"))
 
 
 # ---------------------------------------------------------------------------
 # ④ 決策點、⑤ 權重、⑥ 特徵
 # ---------------------------------------------------------------------------
 def add_features(df: pl.DataFrame, p: BuildParams) -> pl.DataFrame:
-    """⑥ 由狀態算快層特徵與當月 RTP GP_rtp（目前不使用；第 6 節）；只用開獎前已知的欄位，不用當手開獎結果。"""
+    """⑥ 由狀態算快層特徵（第 6 節）；只用開獎前已知的欄位，不用當手開獎結果。"""
     df = df.with_columns(
         GP_dailySpinCount=pl.col("st_d_count"),
         **{f"GP_dailyRate_{o}": _ratio(pl.col(f"st_d_{o}"), pl.col("st_d_count")) for o in OUTCOMES},
         GP_dailyRtp=_ratio(pl.col("st_d_prize"), pl.col("st_d_bet")),
         GP_dailyRate_FREE_GAME=_ratio(pl.col("st_d_FREE_GAME"), pl.col("st_d_count")),
-        GP_rtp=_ratio(pl.col("st_m_prize"), pl.col("st_m_bet")),
-        GP_sessionMinutes=pl.col("st_session_minutes"),
         SY_bet=pl.col("bet"),
         SY_isBuyFeature=pl.col("is_buy").cast(pl.Int8),
         SY_balance=pl.col("balance_before"),
@@ -412,12 +364,9 @@ def add_features(df: pl.DataFrame, p: BuildParams) -> pl.DataFrame:
         SY_first_balance=pl.col("st_session_start_balance"),
         NGP_dailyTotalWinToBet=_ratio(pl.col("st_d_prize"), pl.col("bet")),
     )
-    session_loss = 1 - _ratio(pl.col("SY_balance"), pl.col("SY_first_balance"))
     df = df.with_columns(
         GP_dailyRate_MEDIUM_PLUS=pl.col("GP_dailyRate_MEDIUM_WIN") + pl.col("GP_dailyRate_BIG_WIN"),
         GP_dailyNoWin_x_spins=pl.col("GP_dailyRate_NO_WIN") * pl.col("GP_dailySpinCount").cast(pl.Float64).log1p(),
-        NGP_dailyNoWin_x_sessionLoss=pl.col("GP_dailyRate_NO_WIN")
-        * pl.when(session_loss < 0).then(0.0).otherwise(session_loss),
     )
     return df.with_columns(
         GP_flag_dryLong=((pl.col("GP_dailySpinCount") >= p.dry_min_spins) & (pl.col("GP_dailyRate_MEDIUM_PLUS") == 0))
@@ -627,14 +576,11 @@ def process_bucket(bucket: int, p: BuildParams, debug: bool, store: StorePaths, 
     """處理一個桶：寫出暫存的 dataset_parts/bucket=XX.parquet，回傳統計（by_day：本次各天的逐日統計）。"""
     t0 = time.time()
     raw = pl.read_parquet(store.buckets / f"bucket={bucket:02d}" / "*.parquet", hive_partitioning=False)
-    base = None
-    if store.month_base.exists():
-        base = pl.read_parquet(store.month_base).join(raw.select(PLAYER).unique(), on=PLAYER, how="semi")
     n_raw = raw.height
     if not store.pre_range_last.exists():
         raise DataCheckError(f"找不到 {rel(store.pre_range_last)}：第一段沒有完成，請重跑 build")
     pre_last = pl.read_parquet(store.pre_range_last).join(raw.select(PLAYER).unique(), on=PLAYER, how="semi")
-    spins, merge_stats = build_spin_table(raw, p, base, pre_last)
+    spins, merge_stats = build_spin_table(raw, p, pre_last)
     del raw
     dp, dstats = decision_table(spins, p)
     dp.select(PART_COLUMNS).write_parquet(store.dataset_parts / f"bucket={bucket:02d}.parquet", compression="zstd")

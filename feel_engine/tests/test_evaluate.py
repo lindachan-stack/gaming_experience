@@ -81,7 +81,7 @@ def test_bootstrap_point_equals_direct_estimate():
 
 
 # ---------------------------------------------------------------------------
-# 9.1a 共同範圍
+# 9.1 共同範圍
 # ---------------------------------------------------------------------------
 def overlap_leaf():
     """狀態 X（80%）：a、b 各半，c 幾乎不給（1%）；狀態 Y（20%）：a、b、c 都常給。"""
@@ -207,7 +207,7 @@ def test_merge_incomparable_repeats_up_to_root_and_keeps_comparable_trees():
 
 
 # ---------------------------------------------------------------------------
-# 9.1b 葉子內校準
+# 9.1 葉子內校準
 # ---------------------------------------------------------------------------
 def test_balance_weights_align_means_within_tolerance():
     from feel_engine.evaluation.leaf_eval import balance_weights
@@ -307,3 +307,45 @@ def test_merge_recommendations_merges_similar_only_when_tree_is_bushy():
     assert merge_recommendations(NODES, set(), rec, weak, over_leaves=3) == {4}        # 不超過 3 片 → 照原本只併相同
     assert merge_recommendations(NODES, set(), rec, weak, over_leaves=2) == {1, 4}     # 超過 2 片（龐大）→ 再併相近
 
+
+
+# ---------------------------------------------------------------------------
+# evaluate 前的檢查：run 的輸出要對得上目前的 dataset 與 model.yaml
+# ---------------------------------------------------------------------------
+def test_stale_reason_flags_rebuilt_dataset_and_changed_model_config():
+    from feel_engine.evaluation.evaluate import stale_reason
+
+    rules = {"features": ["GP_a", "TAG_x"], "missing": {"fill": -1, "add_isna": False}, "params": {"categories": {}},
+             "dataset_signature": "abc"}
+    mcfg = {"fast": ["GP_a"], "tags": {"x": ["TAG_x"]}, "missing": {"fill": -1, "add_isna": False}, "categories": {}}
+    assert stale_reason(rules, mcfg, "x", "abc") is None
+    assert "dataset" in stale_reason(rules, mcfg, "x", "xyz")                               # run 之後 dataset 重建過
+    assert "model.yaml" in stale_reason(rules, {**mcfg, "fast": ["GP_a", "GP_b"]}, "x", "abc")   # 欄位清單改了
+    assert "model.yaml" in stale_reason(rules, {**mcfg, "missing": {"fill": 0, "add_isna": False}}, "x", "abc")
+    old = {k: v for k, v in rules.items() if k != "dataset_signature"}
+    assert stale_reason(old, mcfg, "x", "xyz") is None                                      # 舊版輸出沒記簽章：不擋
+    assert stale_reason(rules, mcfg, "x", None) is None                                     # 沒給簽章（變體）：不比
+
+
+def test_stale_reason_flags_a_changed_regroup():
+    """run 之後改了 config.yaml 的 regroup：群名與 TAG_ 類別對不上，要先重跑 run。"""
+    from feel_engine.evaluation.evaluate import stale_reason
+
+    merge = {"TAG_lifecycle": {"流失": "回流"}}
+    rules = {"features": ["GP_a"], "missing": {"fill": -1, "add_isna": False}, "params": {"categories": {}},
+             "regroup": merge}
+    mcfg = {"fast": ["GP_a"], "tags": {"none": []}, "missing": {"fill": -1, "add_isna": False}, "categories": {}}
+    assert stale_reason(rules, mcfg, "none", None, merge) is None
+    assert "regroup" in stale_reason(rules, mcfg, "none", None, None)                     # 現在不合併
+    old = {k: v for k, v in rules.items() if k != "regroup"}                               # 合併前的輸出
+    assert "regroup" in stale_reason(old, mcfg, "none", None, merge)
+    assert stale_reason(old, mcfg, "none", None, {}) is None
+
+
+def test_predictions_missing_from_dataset_are_counted():
+    from feel_engine.evaluation.evaluate import unmatched_predictions
+
+    V = pd.DataFrame({"member_account": ["a", "b", "c"], "spin_ts": [1, 2, 3]})
+    pred = pd.DataFrame({"member_account": ["a", "c", "z"], "spin_ts": [1, 3, 9], "葉子": ["L1", "L1", "L2"]})
+    assert unmatched_predictions(pred, V) == 1
+    assert unmatched_predictions(pred.iloc[:2], V) == 0

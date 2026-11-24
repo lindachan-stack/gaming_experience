@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-第 9.1 節：傾向分數與結果模型（只用驗證期間；evaluate 主流程配適一次、所有實驗共用）。
+第 9.1 節：傾向分數與結果模型（只用驗證期間；配適一次、所有實驗共用）。
 
-  9.1 傾向分數（所有實驗共用、只配適一次）：
-      p(arm | x)，x = 快層 ＋ 所有 TAG_ 標籤（含分群用的標籤）；依玩家 5 折交叉配適；sample_weight = w_cap。
-      模型（config leaf_eval.propensity_model）：logistic = 多項式邏輯迴歸（預設，用 design_matrix 的共變數）；
-      gbm = 梯度提升樹，從資料自動學版本分派的門檻與交互作用（數值保留原值與缺值、文字 one-hot）。
-      2026-10-12 實測 gbm 的權重較極端、有效樣本較少，配合 9.1b 校準後信心不如 logistic，所以預設 logistic。
-      結果模型（同樣只配適一次、依玩家交叉配適）：每個 arm 一個邏輯迴歸，用狀態 x 預測「拿到該 arm 時」的留存率 m_a(x)。
+  傾向分數 p(arm | x)：x = 快層 ＋ 所有 TAG_ 標籤（含分群用的標籤）；依玩家 5 折交叉配適；sample_weight = w_cap。
+      leaf_eval.propensity_model：logistic = 多項式邏輯迴歸（預設，用 design_matrix 的共變數）；
+      gbm = 梯度提升樹（數值保留原值與缺值、文字 one-hot）。實測 gbm 的權重較極端、有效樣本較少、信心較差。
+  結果模型 m_a(x)：每個 arm 一個邏輯迴歸，用同一組共變數預測「拿到該 arm 時」的留存率；同樣依玩家交叉配適。
 """
 from __future__ import annotations
 

@@ -36,13 +36,15 @@ def env(tmp_path, monkeypatch):
     return cfg, StorePaths("TCG_PHP_22071")
 
 
-def write_day(cfg: dict, store: StorePaths, d: date, build_id: str, raw_rows: dict | None = None) -> None:
+def write_day(cfg: dict, store: StorePaths, d: date, build_id: str, raw_rows: dict | None = None,
+              read_plan: dict | None = None) -> None:
     store.dataset_dir.mkdir(parents=True, exist_ok=True)
     pl.DataFrame({"member_account": ["a"], "session_date": [d]}).write_parquet(store.day(d))
     st.write_json(store.day_meta(d), {"session_date": str(d), "build_id": build_id, "fingerprint": st.fingerprint(cfg),
                                       "provisional_arm": True, "rows": 1, "tag_week": "2026-09-21", "stats": {}})
     st.write_json(store.build_meta(build_id), {
-        "build_id": build_id, "stage1": {"raw_rows": raw_rows or {"2026-09-21": 10, "2026-09-22": 20}},
+        "build_id": build_id, "stage1": {"raw_rows": raw_rows or {"2026-09-21": 10, "2026-09-22": 20},
+                                           "read_plan": read_plan or {"back_short": False}},
         "tag_weeks": {"2026-09-21": {"rows": 100, "max_etl_time": "2026-10-07 05:37:02"}}})
 
 
@@ -95,3 +97,40 @@ def test_load_dataset_and_prune_builds(env):
     with pytest.raises(FileNotFoundError):
         st.load_dataset(store, [D3])
     assert st.provisional_arm(store, [D1, D2]) is True
+
+
+def test_day_built_with_short_tail_is_stale_once_cache_extends(env):
+    """建置時快取尾端不足（看不完 Y 的 session 整段不抽）的日子：快取補上之後要判過期；尾端夠的日子、快取沒變長時不動。"""
+    cfg, store = env
+    short = {"back_short": True, "data_end": "2026-09-23T20:00:00-04:00"}     # 當時快取到 UTC 09-23（含）
+    write_day(cfg, store, D1, "b1", read_plan=short)                           # 09-21 需要到 09-23 12:00 美東：看得完
+    write_day(cfg, store, D2, "b1", read_plan=short)                           # 09-22 需要到 09-24 12:00 美東：被截尾
+    assert st.day_status(cfg, store, [D1, D2]) == {D1: st.OK, D2: st.OK}       # 快取還是只到 09-23：重建也一樣
+    bet = paths.bet_records_dir("TCG", "22071")
+    pl.DataFrame({"currency": ["PHP"] * 4, "bet_date": ["2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24"],
+                  "actual_rows": [10, 20, 30, 40]}).write_csv(bet / "_manifest.csv")
+    assert st.day_status(cfg, store, [D1, D2]) == {D1: st.OK, D2: "建置時注單快取尾端不足，現已補上"}
+
+
+def test_dataset_signature_changes_when_a_day_is_rebuilt(env):
+    cfg, store = env
+    write_day(cfg, store, D1, "b1")
+    write_day(cfg, store, D2, "b1")
+    sig = st.dataset_signature(store, [D1, D2])
+    assert sig == st.dataset_signature(store, [D2, D1]) and sig != st.dataset_signature(store, [D1])
+    write_day(cfg, store, D2, "b2")                                            # D2 重建
+    assert st.dataset_signature(store, [D1, D2]) != sig
+
+
+def test_fingerprint_changes_with_flag_thresholds():
+    cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    other = copy.deepcopy(cfg)
+    other["features"]["derived"]["dry_min_spins"] += 1
+    assert st.fingerprint(other) != st.fingerprint(cfg)
+
+
+def test_shipped_config_features_only_hold_flag_thresholds():
+    """config.yaml 的 features 只有兩個旗標的門檻。"""
+    cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    assert set(cfg["features"]) == {"derived"}
+    assert set(cfg["features"]["derived"]) == {"dry_min_spins", "cold_nowin_rate", "loss_ratio"}

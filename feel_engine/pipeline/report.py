@@ -63,12 +63,11 @@ def write_data_quality_report(rp, builds: dict[str, dict], version_map: dict, da
         "每次 build 讀一段連續日子所需的範圍（下表），已建好的日子不重建",
         "",
         _table(
-            ["build", "建置日子", "讀取範圍（美東）", "UTC 日檔", "R7", "月初基準"],
+            ["build", "建置日子", "讀取範圍（美東）", "UTC 日檔", "R7"],
             [[f"`{b['build_id']}`", _span(sorted({b["first_day"], b["last_day"]})),
               f"{b['stage1']['read_plan']['range_start']} 至 {b['stage1']['read_plan']['data_end']}",
               _span(b["stage1"]["read_plan"]["range_days"]),
-              ("⚠️ 後段不足，已截尾" if b["stage1"]["read_plan"]["back_short"] else "**通過**"),
-              f"UTC 日檔 {len(b['stage1']['read_plan']['base_days'])} 個、{b['stage1']['month_base_players']:,} 位玩家"]
+              ("⚠️ 後段不足，已截尾" if b["stage1"]["read_plan"]["back_short"] else "**通過**")]
              for b in builds.values()],
         ),
         "",
@@ -203,7 +202,7 @@ def write_build_report(rp, cfg: dict, train_days: list[str], valid_days: list[st
         age=pl.col("TAG_week_index").map_elements(
             lambda i: (w_date - date.fromisocalendar(i // 100, i % 100, 1)).days // 7, return_dtype=pl.Int64)
     ).group_by("age").agg(players=pl.col("member_account").n_unique(), n=pl.len()).sort("age")
-    nulls = ds.select([pl.col(f).null_count().alias(f) for f in (*FEATURES, "GP_rtp")]).row(0, named=True)
+    nulls = ds.select([pl.col(f).null_count().alias(f) for f in FEATURES]).row(0, named=True)
     flags = {f: float(ds[f].mean()) for f in ("GP_flag_dryLong", "NGP_flag_coldLoss", "SY_isBuyFeature")}
     min_n = int(cfg["splits"]["min_segment_train_n"])
     built_by = Counter(day_metas[d]["build_id"] for d in days)
@@ -227,7 +226,6 @@ def write_build_report(rp, cfg: dict, train_days: list[str], valid_days: list[st
         "，跨午夜的 session 整段歸起點那天",
         f"- dataset：`{rel(rp.store.dataset_dir)}/{{日期}}.parquet`（一天一檔、所有 run 共用），本 run {len(days)} 天、"
         f"{n_ds:,} 列 × {ds.width} 欄；來自 build " + "、".join(f"`{k}`（{n} 天）" for k, n in built_by.items()),
-        "- 月初基準只用於當月 RTP `GP_rtp`（目前不使用）",
         f"- arm：{'⚠️ **暫代模式**（version_map 未填，以 game_version 當 arm）' if provisional else '依 version_map 對應'}",
         f"- 標籤：`{list(builds.values())[-1]['tag_dir']}`",
         "",
@@ -297,7 +295,7 @@ def write_build_report(rp, cfg: dict, train_days: list[str], valid_days: list[st
         f"旗標觸發比例：`GP_flag_dryLong` {flags['GP_flag_dryLong'] * 100:.2f}%、`NGP_flag_coldLoss` "
         f"{flags['NGP_flag_coldLoss'] * 100:.2f}%、`SY_isBuyFeature` {flags['SY_isBuyFeature'] * 100:.2f}%",
         "",
-        _table(["特徵", "缺值", "佔比"], [[f"`{f}`", f"{nulls[f]:,}", _pct(nulls[f], n_ds)] for f in (*FEATURES, "GP_rtp")]),
+        _table(["特徵", "缺值", "佔比"], [[f"`{f}`", f"{nulls[f]:,}", _pct(nulls[f], n_ds)] for f in FEATURES]),
         "",
         "## 待確認事項（SPEC 第 14 節＋本次發現）",
         "",

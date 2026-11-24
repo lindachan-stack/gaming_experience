@@ -7,6 +7,7 @@
   split = all：一棵樹
           lifecycle／value：依 SEG_lifecycle／SEG_value 分群各訓練一棵；該群對應的 TAG_ 欄位與群內常數欄移除；
           群的訓練期間樣本 < min_segment_train_n → 不訓練，沿用 all 的樹（splits.groups 指定的群也一樣）
+類別合併：讀入 dataset 時套用 config.yaml 的 regroup（apply_regroup；流失併入回流），TAG_ 與 SEG_ 一起改。
 實驗 = split × tags，清單與順序在 model.yaml 的 experiments。
 輸出（write_split_outputs）output/{run}/model/{split}/tag_{tags}/：
   tree_rules.json（樹結構、葉子、設定）、valid_predictions.parquet（驗證期間預測）；
@@ -41,6 +42,22 @@ TRAINED, USES_ALL, NOT_MODELED = "自建樹", "沿用 all", "不建模"
 
 class ModelConfigError(ValueError):
     """model.yaml 或 run 參數不合法。"""
+
+
+def apply_regroup(df: pd.DataFrame, regroup: dict[str, dict[str, str]] | None) -> pd.DataFrame:
+    """config.yaml 的 regroup：TAG_ 欄位的類別併入另一類，對應的 SEG_ 分群一起改（例如流失併入回流）。
+    讀入 dataset 時套用，dataset 檔案不動；沒有設定 → 原樣回傳。"""
+    if not regroup:
+        return df
+    tag_to_seg = {tag: seg for seg, tag in SEG_TO_TAG.items()}
+    out = {}
+    for col, mapping in regroup.items():
+        if not col.startswith("TAG_") or col not in df.columns:
+            raise ModelConfigError(f"regroup 只能指定 dataset 中的 TAG_ 欄位（分群跟著改）：{col}")
+        for c in (col, tag_to_seg.get(col)):
+            if c in df.columns:
+                out[c] = df[c].replace(mapping)
+    return df.assign(**out)
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +104,7 @@ def feature_columns(mcfg: dict, tags: str) -> list[str]:
 
 
 def validate_features(cols: list[str], available: Iterable[str]) -> None:
-    """只允許 dataset 中 GP_／NGP_／TAG_ 開頭的欄位，不得重複。"""
+    """只允許 dataset 中 GP_／SY_／NGP_／TAG_ 開頭的欄位，不得重複。"""
     available = set(available)
     dup = sorted({c for c in cols if cols.count(c) > 1})
     if dup:
@@ -411,12 +428,16 @@ def fit_split(train: pd.DataFrame, valid: pd.DataFrame, split: str, tags: str, c
     parts = []
     for name, gt in trees.items():
         mask = group_v.map(tree_of) == name
+        if not mask.any():                                # 這棵樹的群在驗證期間沒有決策點：沒有可預測的列
+            continue
         rows = valid[mask]
         p, leaf = gt.apply(rows)
         parts.append(pd.DataFrame({PLAYER: rows[PLAYER].to_numpy(), "spin_ts": rows["spin_ts"].to_numpy(),
                                    "群": group_v[mask].to_numpy(), "樹": name, "葉子": leaf, "p": p,
                                    "y": rows[LABEL].to_numpy(dtype=int), "w": rows[WEIGHT].to_numpy(dtype=float)},
                                   index=rows.index))
+    if not parts:
+        raise ModelConfigError("驗證期間沒有任何屬於建模群的決策點，無法評估")
     pred = pd.concat(parts).sort_index()
     pred_wy = pred["w"] * pred["y"]
 
@@ -454,10 +475,12 @@ def _jsonable(o):
 
 
 def write_split_outputs(res: SplitResult, model_dir: Path, mcfg: dict, pred_path: Path,
-                        config_path: Path | None = None) -> Path:
+                        config_path: Path | None = None, dataset_signature: str | None = None,
+                        regroup: dict | None = None) -> Path:
     """model_dir/tree_rules.json（樹結構、葉子、設定）與 pred_path（驗證期間預測，供 evaluate、compare 使用）。
 
-    tree_rules.json 另記本次用的 model.yaml 路徑、內容指紋（sha256 前 8 碼）與執行時間。
+    tree_rules.json 另記本次用的 model.yaml 路徑、內容指紋（sha256 前 8 碼）、執行時間，以及 run 當時的 dataset 簽章
+    （store.dataset_signature）與 config.yaml 的 regroup；evaluate 據此判斷 dataset 或類別合併之後有沒有改過。
     """
     model_dir.mkdir(parents=True, exist_ok=True)
     pred_path.parent.mkdir(parents=True, exist_ok=True)
@@ -467,6 +490,8 @@ def write_split_outputs(res: SplitResult, model_dir: Path, mcfg: dict, pred_path
         "run_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "model_config_file": str(config_path) if config_path else None,
         "model_config_sha": hashlib.sha256(Path(config_path).read_bytes()).hexdigest()[:8] if config_path else None,
+        "dataset_signature": dataset_signature,
+        "regroup": regroup or {},
         "features": res.features, "labels": {c: mcfg["labels"][c] for c in res.features if c in mcfg.get("labels", {})},
         "params": res.params, "missing": mcfg["missing"],
         "groups": res.groups.to_dict(orient="records"),

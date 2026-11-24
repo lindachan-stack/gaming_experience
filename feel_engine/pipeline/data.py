@@ -2,19 +2,15 @@
 """
 第一段：日檔 → 玩家分桶（SPEC 5.0、5.1、第 12 節 R1–R4、R7）。
 
-  dataset 逐日存（output/{商戶}_{幣別}_{遊戲}/dataset/{美東日}.parquet），build 只建還沒有的日子：
-  缺的日子依連續區段分組，每段一次讀完（之後建一份 session 表，見 build.py）：
+  build 只建還沒有（或已過期）的日子：缺的日子依連續區段分組，每段一次讀完。
   R1 manifest 對帳（只看設定的幣別）→ R7 讀取範圍（區段第一天 0 點 − pre_hours 至最後一天 24:00 + post_hours + return_window）
-  → 月初基準：當月 1 日美東 0 點至讀取範圍起點，只讀 4 欄，加總成玩家 × Σbet、Σprize
   → 範圍內日檔讀 9 欄，只留範圍內的列 → R2 去重、R3、R4 → 轉美東 → 依 member_account 雜湊寫入分桶（暫存，build 結束即刪）
 
-與 SPEC 的差異：
-  - game_version → arm 的對應移到第二段（build.py）做，桶內保留 game_version。
-    結果相同，但 version_map 填好後只需重跑第二段（cli build --from-buckets）。
+實作細節：
+  - game_version → arm 的對應在第二段（build.py）做，桶內保留 game_version。
   - 每列加 seq = 日序 × SEQ_STRIDE + 檔內列號，作為「同秒保留檔內 id 順序」的穩定排序鍵。
-  - BUY 手以 game_mode 位元 16 判定（sql.md 規定位元遮罩不得用 = 比對）；
-    實測付費手的 game_mode 只有 1、3、19，與 SPEC 的「game_mode = 19」結果相同。
-  - 含 FreeGame 的手以 game_mode 位元 2（Free）判定 → is_free：3 = 一般手中 FreeGame、19 = BUY（必含）。
+  - BUY 手以 game_mode 位元 16 判定（位元遮罩不得用 = 比對）；實測付費手的 game_mode 只有 1、3、19，等同 game_mode = 19。
+  - 含 FreeGame 的手以 game_mode 位元 2 判定 → is_free：3 = 一般手中 FreeGame、19 = BUY（必含）。
     是當手開獎結果，只能用來算「當手之前」的水池特徵。
 """
 from __future__ import annotations
@@ -48,7 +44,6 @@ BUY_BIT = 16          # game_mode 位元：BUY
 FREE_BIT = 2          # game_mode 位元：Free（含 FreeGame）
 READ_COLUMNS = ("id", "member_account", "create_at", "bet_points", "prize", "points", "last_points",
                 "game_version", "game_mode")
-BASE_COLUMNS = ("member_account", "create_at", "bet_points", "prize")
 BUCKET_COLUMNS = ("member_account", "seq", "ts", "bet_points", "prize", "points", "last_points",
                   "game_version", "is_buy", "is_free")
 SEQ_STRIDE = 1_000_000_000
@@ -204,42 +199,38 @@ def check_manifest(bet_dir: Path, currency: str) -> dict[date, Path]:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ReadPlan:
-    first_day: date                # 美東；訓練日
-    last_day: date                 # 美東；驗證期間最後一天
+    first_day: date                # 美東；本次 build 的第一天
+    last_day: date                 # 美東；本次 build 的最後一天
     range_start: datetime          # 美東 first_day 0 點 − pre_hours
     analysis_end: datetime         # 美東 last_day 24 點
     range_end: datetime            # analysis_end + post_hours（接完跨午夜的 session）+ return_window
     data_end: datetime             # min(range_end, 快取終點)；5.3 截尾用
-    month_start: datetime          # 美東 first_day 當月 1 日 0 點
     range_days: tuple[date, ...]   # 範圍內要讀的 UTC 日檔
-    base_days: tuple[date, ...]    # 月初基準要讀的 UTC 日檔
     back_short: bool               # 後段不足（已截尾）
 
     def to_json(self) -> dict:
         out = {k: (v.isoformat() if isinstance(v, (date, datetime)) else v) for k, v in asdict(self).items()}
         out["range_days"] = [d.isoformat() for d in self.range_days]
-        out["base_days"] = [d.isoformat() for d in self.base_days]
         return out
 
 
 def plan_read(first_day: date, last_day: date, pre_hours: float, return_hours: float, cache_days: list[date],
               post_hours: float = 0.0) -> ReadPlan:
-    """R7：快取是否涵蓋讀取範圍。前段（含月初基準）或分析日不足 → 中止；只有後段不足 → 警告並截尾。
+    """R7：快取是否涵蓋讀取範圍。前段或分析日不足 → 中止；只有後段不足 → 警告並截尾。
 
-    讀取範圍一次涵蓋 first_day（訓練期間第一天）到 last_day（驗證期間最後一天）；post_hours：起點在 last_day 的 session 可能跨過午夜，
+    讀取範圍一次涵蓋 first_day 到 last_day（本次 build 的連續日子）；post_hours：起點在 last_day 的 session 可能跨過午夜，
     往後多讀這麼久再加 return_hours 才看得到它的 Y。
     """
     range_start = et_midnight(first_day) - timedelta(hours=pre_hours)
     analysis_end = et_midnight(last_day + timedelta(days=1))
     range_end = analysis_end + timedelta(hours=post_hours + return_hours)
-    month_start = et_midnight(first_day.replace(day=1))
 
     cache_start = datetime.combine(min(cache_days), dtime.min, tzinfo=timezone.utc)
     cache_end = datetime.combine(max(cache_days) + timedelta(days=1), dtime.min, tzinfo=timezone.utc)
 
-    missing_front = utc_days_overlapping(min(range_start, month_start), cache_start)
+    missing_front = utc_days_overlapping(range_start, cache_start)
     if missing_front:
-        raise DataCheckError(f"R7 前段不足（讀取範圍或月初基準起點早於快取），缺 UTC 日檔：{missing_front}")
+        raise DataCheckError(f"R7 前段不足（讀取範圍起點早於快取），缺 UTC 日檔：{missing_front}")
     if cache_end < analysis_end:
         missing = utc_days_overlapping(cache_end, analysis_end)
         raise DataCheckError(f"R7 分析日 {last_day} 超出快取（快取到美東 {cache_end.astimezone(ET)}），缺 UTC 日檔：{missing}")
@@ -255,39 +246,14 @@ def plan_read(first_day: date, last_day: date, pre_hours: float, return_hours: f
         analysis_end=analysis_end,
         range_end=range_end,
         data_end=data_end,
-        month_start=month_start,
         range_days=tuple(utc_days_overlapping(range_start, data_end)),
-        base_days=tuple(utc_days_overlapping(month_start, range_start)),
         back_short=back_short,
     )
 
 
 # ---------------------------------------------------------------------------
-# 月初基準、單日處理、分桶
+# 單日處理、分桶
 # ---------------------------------------------------------------------------
-def month_base_from_files(paths: list[Path], start: datetime, end: datetime) -> pl.DataFrame:
-    """逐檔只讀 4 欄，加總 [start, end) 內每位玩家的 Σbet、Σprize（免費局贏分照樣計入）。
-
-    免費列併入同玩家前一個付費手、算在那一手的月份（5.1）：玩家在窗口內第一個付費手之前的免費列，
-    前一個付費手在 start 之前（上個月），不計入。paths 依日期排序；檔內依 create_at、id 排序。
-    """
-    parts, seen = [], pl.Series("member_account", [], dtype=pl.String)
-    for p in paths:
-        df = (pl.read_parquet(p, columns=list(BASE_COLUMNS), hive_partitioning=False)
-              .filter((pl.col("create_at") >= utc_naive(start)) & (pl.col("create_at") < utc_naive(end)))
-              .with_row_index("row"))
-        first = df.filter(pl.col("bet_points") > 0).group_by("member_account").agg(first_paid=pl.col("row").min())
-        kept = (df.join(first, on="member_account", how="left")
-                .filter(pl.col("member_account").is_in(seen.implode())
-                        | (pl.col("first_paid").is_not_null() & (pl.col("row") >= pl.col("first_paid")))))
-        parts.append(kept.group_by("member_account").agg(base_bet=pl.col("bet_points").sum(), base_prize=pl.col("prize").sum()))
-        seen = pl.concat([seen, first["member_account"]]).unique()
-    if not parts:
-        return pl.DataFrame(schema={"member_account": pl.String, "base_bet": pl.Int64, "base_prize": pl.Int64})
-    return (pl.concat(parts).group_by("member_account")
-            .agg(pl.col("base_bet").sum(), pl.col("base_prize").sum()).sort("member_account"))
-
-
 def pre_range_last_paid(paths: list[Path], start: datetime, end: datetime) -> pl.DataFrame:
     """[start, end) 內每位玩家最後一個付費手的時間（UTC naive）。
 
@@ -381,17 +347,13 @@ def run_stage1(cfg: dict, first_day: date, last_day: date, store: StorePaths) ->
         cache_days,
         post_hours=float(cfg["data"].get("post_hours", 0)),
     )
-    log.info("R7 通過：讀取範圍美東 %s 至 %s（UTC 日檔 %s）；月初基準 %s 起（UTC 日檔 %d 個）",
-             plan.range_start, plan.data_end, [str(d) for d in plan.range_days], plan.month_start, len(plan.base_days))
+    log.info("R7 通過：讀取範圍美東 %s 至 %s（UTC 日檔 %s）",
+             plan.range_start, plan.data_end, [str(d) for d in plan.range_days])
 
     if store.tmp_dir.exists():
         shutil.rmtree(store.tmp_dir)  # 只清本程式自己產生的暫存（上次中斷殘留的分桶）
     store.buckets.mkdir(parents=True)
 
-    base_t = time.time()
-    base = month_base_from_files([files[d] for d in plan.base_days], plan.month_start, plan.range_start)
-    base.write_parquet(store.month_base, compression="zstd")
-    log.info("月初基準：%s 位玩家（%.1fs）", f"{base.height:,}", time.time() - base_t)
     gap = timedelta(minutes=float(cfg["labels"]["session_gap_minutes"]))
     pre_days = utc_days_overlapping(plan.range_start - gap, plan.range_start)
     pre = pre_range_last_paid([files[d] for d in pre_days if d in files], plan.range_start - gap, plan.range_start)
@@ -416,7 +378,7 @@ def run_stage1(cfg: dict, first_day: date, last_day: date, store: StorePaths) ->
         for k, v in s["version_counts"].items():
             version_counts[k] = version_counts.get(k, 0) + v
 
-    used = sorted({*plan.base_days, *pre_days, *plan.range_days} & set(files))
+    used = sorted({*pre_days, *plan.range_days} & set(files))
     meta = {
         "first_day": str(first_day), "last_day": str(last_day),
         "merchant": cfg["data"]["merchant"], "currency": cfg["data"]["currency"], "game": cfg["data"]["game"],
@@ -426,7 +388,6 @@ def run_stage1(cfg: dict, first_day: date, last_day: date, store: StorePaths) ->
         "cache_end_utc": str(cache_days[-1] + timedelta(days=1)),
         "raw_rows": raw_rows(bet_dir, cfg["data"]["currency"], used),   # 用到的日檔列數；之後快取重抓時據此判斷 dataset 過期
         "read_plan": plan.to_json(),
-        "month_base_players": base.height,
         "pre_range_players": pre.height,
         "days": per_day,
         "version_counts": dict(sorted(version_counts.items())),

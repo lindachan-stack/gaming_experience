@@ -2,6 +2,8 @@
 """SPEC 第 8 節：決策樹（合成資料，不讀快取）。"""
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -58,11 +60,11 @@ def test_unknown_and_duplicate_columns_are_rejected():
 
 
 def test_shipped_model_config_matches_dataset_features_and_experiments():
-    """model.yaml 的快層都是 dataset 有的欄位（不含 GP_rtp）且都有中文名稱；tags 的標籤組合；實驗清單 = 使用者定義的 8 組。"""
+    """model.yaml 的快層都是 dataset 有的欄位且都有中文名稱；tags 的標籤組合；實驗清單 = 使用者定義的 8 組。"""
     from feel_engine.pipeline.build import FEATURES
     mcfg = load_model_config(MODEL_CONFIG_PATH)
     fast = feature_columns(mcfg, "none")
-    assert set(fast) <= set(FEATURES) and "GP_rtp" not in fast and len(set(fast)) == len(fast)
+    assert set(fast) <= set(FEATURES) and len(set(fast)) == len(fast)
     assert feature_columns(mcfg, "lifecycle") == [*fast, "TAG_lifecycle"]
     assert feature_columns(mcfg, "value") == [*fast, "TAG_value_combined"]
     assert feature_columns(mcfg, "lifecycle_value") == [*fast, "TAG_lifecycle", "TAG_value_combined"]
@@ -72,6 +74,14 @@ def test_shipped_model_config_matches_dataset_features_and_experiments():
         ("lifecycle", "none"), ("lifecycle", "value"),
         ("value", "none"), ("value", "lifecycle"),
     ]
+
+
+def test_dataset_fast_features_are_exactly_those_listed_in_model_yaml():
+    """dataset 的快層 = model.yaml fast 列出的欄位（含註解掉、暫不放進 X 的）；model.yaml 沒列的不產生。"""
+    from feel_engine.pipeline.build import FEATURES
+    block = MODEL_CONFIG_PATH.read_text(encoding="utf-8").split("\nfast:")[1].split("\ntags:")[0]
+    listed = re.findall(r"^\s*(?:#\s*)?-\s*(\w+)\s*:", block, flags=re.M)
+    assert sorted(listed) == sorted(FEATURES)
 
 
 def test_config_entries_can_carry_chinese_labels_used_in_rules(tmp_path):
@@ -264,3 +274,72 @@ def test_node_test_reads_missing_onehot_binary_and_integer_thresholds():
     assert node_test(enc, col["GP_count"], 35.5)["text"] == ["今日已玩手數", "≤ 35？"]      # 整數欄位：≤ 35.5 = ≤ 35
     assert node_test(enc, col["GP_count"], 1.5)["text"] == ["今日已玩手數", "= 0？"]
     assert node_test(enc, col["TAG_v=高"], 0.5) == {"text": ["價值等級", "= 高？"], "left_label": "否", "right_label": "是"}
+
+
+def test_trained_group_without_validation_rows_is_skipped():
+    """自建樹的群在驗證期間沒有任何決策點：該群不預測（驗證 0 筆），其他群照常，不當機。"""
+    train, valid = days(split_frame())
+    res = fit_split(train, valid[valid["SEG_value"] != "高"], "value", "none", CFG, {**MCFG, "fast": ["GP_a"]})
+    g = res.groups.set_index("群")
+    assert g.loc["高", "策略"] == "自建樹" and g.loc["高", "驗證"] == 0
+    assert set(res.predictions["群"]) == {"低"} and len(res.predictions) == 100
+    assert (res.leaves.loc[res.leaves["樹"] == "高", "驗證決策點"] == 0).all()
+
+
+def test_tree_rules_record_the_dataset_signature(tmp_path):
+    """tree_rules.json 記下 run 當時的 dataset 簽章，evaluate 據此判斷 dataset 之後有沒有重建。"""
+    import json
+
+    from feel_engine.modeling.model import write_split_outputs
+
+    mcfg = {**MCFG, "fast": ["GP_a"], "labels": {}}
+    res = fit_split(*days(split_frame()), "all", "none", CFG, mcfg)
+    path = write_split_outputs(res, tmp_path / "m", mcfg, tmp_path / "m" / "p.parquet", dataset_signature="abc123")
+    assert json.loads(path.read_text(encoding="utf-8"))["dataset_signature"] == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# 類別合併（config.yaml regroup）
+# ---------------------------------------------------------------------------
+def test_regroup_merges_tag_and_its_segment_and_leaves_others():
+    """流失併入回流：TAG_lifecycle 與分群 SEG_lifecycle 一起改；其他類別與其他欄位不動；原資料不被修改。"""
+    from feel_engine.modeling.model import apply_regroup
+
+    df = pd.DataFrame({"TAG_lifecycle": ["流失", "回流", "新手"], "SEG_lifecycle": ["流失", "回流", "新手"],
+                       "TAG_value_combined": ["流失", "低", "高"]})
+    out = apply_regroup(df, {"TAG_lifecycle": {"流失": "回流"}})
+    assert out["TAG_lifecycle"].tolist() == ["回流", "回流", "新手"]
+    assert out["SEG_lifecycle"].tolist() == ["回流", "回流", "新手"]
+    assert out["TAG_value_combined"].tolist() == ["流失", "低", "高"]
+    assert df["TAG_lifecycle"].tolist() == ["流失", "回流", "新手"]
+    assert apply_regroup(df, None) is df and apply_regroup(df, {}) is df
+
+
+def test_regroup_only_accepts_tag_columns():
+    from feel_engine.modeling.model import apply_regroup
+
+    df = pd.DataFrame({"SEG_lifecycle": ["流失"], "TAG_lifecycle": ["流失"]})
+    with pytest.raises(ModelConfigError):
+        apply_regroup(df, {"SEG_lifecycle": {"流失": "回流"}})        # 分群跟著 TAG_ 改，不能單獨指定
+    with pytest.raises(ModelConfigError):
+        apply_regroup(df, {"TAG_missing": {"a": "b"}})               # dataset 沒有的欄位
+
+
+def test_shipped_config_merges_churned_into_returning():
+    """後續測試的規則：生命週期的流失併入回流（SPEC 7、8.1）。"""
+    from feel_engine.pipeline.data import load_config
+
+    assert load_config()["regroup"] == {"TAG_lifecycle": {"流失": "回流"}}
+
+
+def test_tree_rules_record_the_regroup(tmp_path):
+    """tree_rules.json 記下 run 當時的類別合併，evaluate 據此判斷設定有沒有改過。"""
+    import json
+
+    from feel_engine.modeling.model import write_split_outputs
+
+    mcfg = {**MCFG, "fast": ["GP_a"], "labels": {}}
+    res = fit_split(*days(split_frame()), "all", "none", CFG, mcfg)
+    path = write_split_outputs(res, tmp_path / "m", mcfg, tmp_path / "m" / "p.parquet",
+                               regroup={"TAG_lifecycle": {"流失": "回流"}})
+    assert json.loads(path.read_text(encoding="utf-8"))["regroup"] == {"TAG_lifecycle": {"流失": "回流"}}

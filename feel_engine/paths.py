@@ -8,7 +8,7 @@
   output/{key}/dataset/{美東日}.parquet       決策點，依 session_date 一天一檔（所有 run 共用，可重跑產生）
   output/{key}/dataset/{美東日}.json          該日的建置指紋、列數、逐日統計（build 報告用）
   output/{key}/dataset/builds/{build_id}.json 一次 build 讀了哪些日檔、R1–R7 檢查結果（資料檢查報告用）
-  output/{key}/_build_tmp/                    build 中的暫存（分桶、月初基準）；build 結束即刪
+  output/{key}/_build_tmp/                    build 中的暫存（分桶、讀取範圍起點前最後一個付費手）；build 結束即刪
   {run} = {key}/train_{起}-{迄}_valid_{起}[-{迄}]（例：TCG_PHP_22071/train_20260831-20260913_valid_20260921-20260927）
   output/{run}/model/              各實驗的樹結構（tree_rules.json）與驗證期間預測，供 evaluate、compare 讀取
   output/{run}/state_debug/        build 時隨機 5 位玩家的完整逐手狀態
@@ -74,10 +74,6 @@ class StorePaths:
     @property
     def buckets(self) -> Path:
         return self.tmp_dir / "buckets"
-
-    @property
-    def month_base(self) -> Path:
-        return self.tmp_dir / "month_base.parquet"
 
     @property
     def pre_range_last(self) -> Path:

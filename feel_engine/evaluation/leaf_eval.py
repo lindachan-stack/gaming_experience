@@ -2,17 +2,17 @@
 """
 第 9 節：每片葉子 × arm 的評估（共同範圍、葉子內校準、加權留存率、bootstrap、最高留存 arm）。
 
-  9.1a 共同範圍（2026-10-15 起，取代 propensity_min）：每片葉子挑要比較的 arm 組合 C，共同範圍 S = 葉子內
-      「C 的每個 arm 機率都 ≥ overlap_min」的決策點，C 的每個 arm 在 S 內都要 ≥ min_n_per_arm 筆。
-      盡量多比幾個 arm，但 S 要涵蓋葉子 ≥ min_overlap_share；沒有組合做得到 → 選涵蓋最多的（信心最多「低」）。
-      現行規則幾乎只給某版本的狀態（機率極低的那一邊）不拿來比，避免把「誰拿到」當成「版本效果」。
-  9.1b 葉子內校準（leaf_eval.balance_calibration）：S 內每個比較 arm，以 W = w_cap / p(實際 arm) 為起點調整權重，
+  9.1 共同範圍：每片葉子挑要比較的 arm 組合 C，共同範圍 S = 葉子內「C 的每個 arm 傾向分數都 ≥ overlap_min」的決策點，
+      C 的每個 arm 在 S 內都要 ≥ min_n_per_arm 筆。盡量多比幾個 arm，但 S 要涵蓋葉子 ≥ min_overlap_share；
+      沒有組合做得到 → 選涵蓋最多的（信心最多「低」）。現行規則幾乎只給某版本的狀態不拿來比，
+      避免把「誰拿到」當成「版本效果」。
+  9.1 葉子內校準（leaf_eval.balance_calibration）：S 內每個比較 arm，以 W = w_cap ÷ p(實際 arm) 為起點調整權重，
       讓該 arm 各共變數的加權平均與 S 相差 ≤ balance_tolerance 個標準差（近似 entropy balancing）；比 W 更平衡才採用。
-      對不齊時平衡檢查照實判未平衡。只用資料，不用遊戲端規則。
-  9.2 每片葉子 × arm：加權留存率 = 雙重穩健（DR）估計
+      對不齊時平衡檢查照實判未平衡。
+  9.2 加權留存率 = 雙重穩健（DR）估計
         = S 內 m_a 的 w_cap 加權平均 ＋ S 內實際拿到 a 者「y − m_a」的校準權重平均（y = 1 − churnNext20）；
-      max_smd（對 S）、有效樣本。最高留存 arm = 比較 arm 中加權留存率最高者；與次高、與臨時基準（n 最大的 arm）比較，
-      差距用玩家層級 Poisson(1) bootstrap（先聚合成「玩家 × 葉子 × arm」再以稀疏矩陣運算）。
+      另算 max_smd（對 S）與有效樣本。最高留存 arm = 比較 arm 中加權留存率最高者；與次高、與臨時基準（n 最大的 arm）
+      的差距用玩家層級 Poisson(1) bootstrap（先聚合成「玩家 × 葉子 × arm」再以稀疏矩陣運算）。
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ CALIBRATION_BOUND = 20.0                    # 對偶變數上限（避免對不�
 
 
 # ---------------------------------------------------------------------------
-# 9.1a 共同範圍
+# 9.1 共同範圍
 # ---------------------------------------------------------------------------
 def choose_common_range(arm_code: np.ndarray, P: np.ndarray, min_n: int, overlap_min: float,
                         min_share: float) -> tuple[tuple[int, ...], np.ndarray]:
@@ -250,7 +250,7 @@ def best_arms(stats: pd.DataFrame, boot: dict[tuple[str, str], np.ndarray], leaf
 
 
 # ---------------------------------------------------------------------------
-# 9.1b 葉子內校準
+# 9.1 葉子內校準
 # ---------------------------------------------------------------------------
 def balance_weights(X: np.ndarray, q: np.ndarray, tol: float) -> np.ndarray:
     """近似 entropy balancing：在 q（起始權重）附近找權重 w，使 X 各欄的加權平均都在 ±tol 內（X 已減去目標、除以標準差）。
@@ -277,7 +277,7 @@ def balance_weights(X: np.ndarray, q: np.ndarray, tol: float) -> np.ndarray:
 
 
 def calibrate_leaf_weights(df: pd.DataFrame, Z: np.ndarray, tol: float) -> np.ndarray:
-    """9.1b：共同範圍內每個比較 arm 校準權重，讓 arm 的加權平均狀態對齊共同範圍；比原本的 W 更平衡才採用。回傳新的 W。"""
+    """9.1：共同範圍內每個比較 arm 校準權重，讓 arm 的加權平均狀態對齊共同範圍；比原本的 W 更平衡才採用。回傳新的 W。"""
     W = df["W"].to_numpy(dtype=float).copy()
     pos = pd.Series(np.arange(len(df)), index=df.index)
     for _, g in df.groupby("葉子", sort=False):
@@ -301,7 +301,7 @@ def calibrate_leaf_weights(df: pd.DataFrame, Z: np.ndarray, tol: float) -> np.nd
 
 
 # ---------------------------------------------------------------------------
-# 9.1a–9.2 一次做完
+# 9.1–9.2 一次做完
 # ---------------------------------------------------------------------------
 def evaluate_leaves(df: pd.DataFrame, ps: Propensity, le: dict, seed: int, leaf_order: list[str]):
     df, info = common_range(df, ps.P, le)

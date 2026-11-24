@@ -29,7 +29,8 @@ from feel_engine.pipeline.data import (
     run_stage1,
     version_map_missing,
 )
-from feel_engine.pipeline.store import OK, build_metas, check_days, day_metas, day_status, fingerprint, prune_builds
+from feel_engine.pipeline.store import (OK, build_metas, check_days, dataset_signature, day_metas, day_status, fingerprint,
+                                        prune_builds)
 from feel_engine.paths import CONFIG_PATH, MODEL_CONFIG_PATH, rel, run_paths
 
 log = logging.getLogger("feel_engine")
@@ -110,10 +111,13 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_train_valid(cfg: dict):
-    """（訓練期間 dataset, 驗證期間 dataset）：從逐日 dataset 讀訓練期間與驗證期間的日子（pandas）。
-    有缺或過期的日子 → 回傳 None（請先 build）。"""
-    from feel_engine.pipeline.store import load_dataset
+def _load_train_valid(cfg: dict, with_train: bool = True):
+    """（訓練期間 dataset, 驗證期間 dataset）：從逐日 dataset 讀訓練期間與驗證期間的日子（pandas），
+    並套用 config.yaml 的 regroup（類別合併）。
+    有缺或過期的日子 → 回傳 None（請先 build）。with_train = False（evaluate 只用驗證期間）：不讀訓練期間，
+    第一項回傳 None；缺或過期的檢查仍涵蓋兩段期間（樹是用訓練期間長的）。"""
+    from feel_engine.modeling.model import apply_regroup
+    from feel_engine.pipeline import store as st
 
     train, valid = _run_days(cfg)
     store = run_paths(run_name(cfg)).store
@@ -123,7 +127,11 @@ def _load_train_valid(cfg: dict):
             log.error(p)
         log.error("請先執行 build（只會建缺的或過期的日子）")
         return None
-    return load_dataset(store, train).to_pandas(), load_dataset(store, valid).to_pandas()
+
+    def load(days):
+        return apply_regroup(st.load_dataset(store, days).to_pandas(), cfg.get("regroup"))
+
+    return (load(train) if with_train else None), load(valid)
 
 
 def _summary(rp, cfg: dict, model_config) -> None:
@@ -182,6 +190,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
     train, valid = loaded
     rp = run_paths(run_name(cfg))
+    days = _run_days(cfg)
+    signature = dataset_signature(rp.store, [*days[0], *days[1]])    # 記進 tree_rules.json，evaluate 比對
     if args.clean:
         _clean_model_outputs(rp)
     for split, tags in runs:
@@ -190,7 +200,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         except ModelConfigError:
             log.exception("設定不合法，中止")
             return 1
-        write_split_outputs(res, rp.model_dir(split, tags), mcfg, rp.model_predictions(split, tags), args.model_config)
+        write_split_outputs(res, rp.model_dir(split, tags), mcfg, rp.model_predictions(split, tags), args.model_config,
+                            dataset_signature=signature, regroup=cfg.get("regroup"))
         n = res.groups["策略"].value_counts()
         log.info("split=%s TAG_=%s：%d 棵樹（自建 %d 群、沿用 all %d 群、不建模 %d 群），驗證期間加權 AUC %s",
                  split, tags, len(res.trees), n.get(TRAINED, 0), n.get("沿用 all", 0), n.get(NOT_MODELED, 0),
@@ -202,7 +213,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
     """第 9 節：已跑過決策樹的實驗，每片葉子 × arm 的加權留存率（共同範圍內的雙重穩健估計）與最高留存 arm，每個實驗寫一頁 HTML。"""
-    from feel_engine.evaluation.evaluate import evaluate_experiments
+    from feel_engine.evaluation.evaluate import StaleOutputError, evaluate_experiments
     from feel_engine.modeling.model import ModelConfigError, load_model_config
 
     cfg = load_config(args.config)
@@ -214,12 +225,17 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     from feel_engine.pipeline.store import provisional_arm
 
     rp = run_paths(run_name(cfg))
-    loaded = _load_train_valid(cfg)
+    loaded = _load_train_valid(cfg, with_train=False)             # 第 9 節只用驗證期間
     if loaded is None:
         return 1
     valid = loaded[1]
-    provisional = provisional_arm(rp.store, [*_run_days(cfg)[0], *_run_days(cfg)[1]])
-    paths = evaluate_experiments(rp, cfg, mcfg, valid, provisional)
+    days = [*_run_days(cfg)[0], *_run_days(cfg)[1]]
+    provisional = provisional_arm(rp.store, days)
+    try:
+        paths = evaluate_experiments(rp, cfg, mcfg, valid, provisional, dataset_signature(rp.store, days))
+    except StaleOutputError:
+        log.exception("run 的輸出對不上目前的 dataset，中止")
+        return 1
     if paths:
         log.info("實驗頁面 %d 個 → %s；總覽 %s", len(paths), rel(rp.result_dir), rel(rp.summary_html))
     log.warning("第 10–11 節（換算體感模組 M1–M7、離線評估）尚未實作")
